@@ -2,9 +2,9 @@ import requests, pandas as pd, io, os
 from datetime import datetime, timedelta
 
 H = {"User-Agent": "Mozilla/5.0",
-     "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd"}
-GEN = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
-DL  = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
+     "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd"}
+GEN = "https://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
+DL  = "https://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
 
 def fetch(d):
     p = {"locale": "ko_KR", "mktId": "ALL", "trdDd": d,
@@ -14,14 +14,20 @@ def fetch(d):
     r = requests.post(DL, data={"code": otp}, headers=H, timeout=30)
     return pd.read_csv(io.BytesIO(r.content), encoding="euc-kr")
 
+df = None
 for i in range(10):
     d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
     try:
-        df = fetch(d)
-        if len(df) > 100 and df["거래량"].sum() > 0:
+        t = fetch(d)
+        print(d, "행수", len(t), "| 컬럼", list(t.columns)[:6])
+        if len(t) > 100:
+            df = t
             break
-    except Exception:
-        continue
+    except Exception as e:
+        print(d, "실패:", repr(e)[:200])
+
+if df is None:
+    raise SystemExit("10일치 모두 실패 - 위 로그 확인")
 
 df = df.rename(columns={"종목코드": "code", "종목명": "name", "시장구분": "market"})
 df = df[df["market"].isin(["KOSPI", "KOSDAQ"])]
