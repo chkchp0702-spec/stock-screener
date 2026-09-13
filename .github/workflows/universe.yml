@@ -1,0 +1,31 @@
+name: universe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 23 * * 0-4"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests pandas
+
+      - run: python build_universe.py
+
+      - name: commit universe
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "universe update"
+          git push
