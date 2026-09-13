@@ -1,0 +1,25 @@
+name: universe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 9 * * 1-5"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests pandas
+
+      - run: python build_universe.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: universe
+          path: data/universe_latest.csv
