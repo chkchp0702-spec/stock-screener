@@ -1,19 +1,26 @@
-import requests
+import requests, json
 
 H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json, text/plain, */*",
+     "Referer": "https://www.nextrade.co.kr/"}
 
-tests = [
-    ("메인", "https://www.nextrade.co.kr/"),
-    ("시세1", "https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do"),
-    ("시세2", "https://www.nextrade.co.kr/menu/mrktinfo/MRKT_0001/"),
-    ("API", "https://api.nextrade.co.kr/v1/quotes"),
-]
+U = "https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do"
 
-for name, url in tests:
+for label, kw in [("GET", {}),
+                  ("GET big", {"params": {"pageUnit": 1000, "pageSize": 1000}}),
+                  ("POST", {"data": {"pageUnit": 1000, "pageSize": 1000}})]:
     try:
-        r = requests.get(url, headers=H, timeout=15)
-        print(f"=== {name} === status {r.status_code} len {len(r.text)}")
-        print(r.text[:300].replace("\n", " "))
+        m = requests.post if label == "POST" else requests.get
+        r = m(U, headers=H, timeout=20, **kw)
+        print(f"\n===== {label} status {r.status_code} len {len(r.text)} =====")
+        j = r.json()
+        print("KEYS:", list(j.keys()))
+        lst = j.get("brdinfoTimeList", [])
+        print("COUNT:", len(lst))
+        if lst:
+            print("FIELDS:", list(lst[0].keys()))
+            print("REC0:", json.dumps(lst[0], ensure_ascii=False))
+            print("REC1:", json.dumps(lst[1], ensure_ascii=False) if len(lst) > 1 else "-")
     except Exception as e:
-        print(f"=== {name} === 실패 {repr(e)[:120]}")
+        print(f"\n===== {label} 실패 {repr(e)[:200]}")
