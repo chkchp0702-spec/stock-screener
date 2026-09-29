@@ -249,7 +249,7 @@ if os.path.exists(THEMES) and len(reg) >= 3 and HHMM < 1430:
         groups = []
         for (kind, no, gname), g in th.groupby(["kind", "no", "group"]):
             codes = list(g["code"])
-            if not (3 <= len(codes) <= 60): continue
+            if not (3 <= len(codes) <= 120): continue
             m = px.loc[codes].sort_values("등락률", ascending=False)
             big = m[m["거래대금"] >= 1e10]
             if big.empty: continue
