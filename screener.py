@@ -12,6 +12,7 @@ TG_CHAT = os.environ.get("TG_CHAT", "")
 HHMM = NOW.hour * 100 + NOW.minute
 PRE = HHMM < 900
 MAX_ALERTS = 5
+MAX_THEME = 3          # 하루 섹터(후발주) 알람 상한
 
 H = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
@@ -157,7 +158,7 @@ if os.path.exists(TRACK):
                 tr.at[i, "청산알림"] = flag
         tr.to_csv(TRACK, index=False, encoding="utf-8-sig")
         tt = tr[tr["시각"].astype(str).str.startswith(TODAY)]
-        today_cnt = len(tt)
+        today_cnt = int((tt["유형"] != "후발주").sum())   # 후발주는 별도 상한
         for v in reversed(list(tt.dropna(subset=["30분"]).sort_values("시각")["30분"])):
             if v < 0: streak_loss += 1
             else: break
@@ -206,25 +207,119 @@ if NOW.hour >= 15 and (open(DONE).read().strip() if os.path.exists(DONE) else ""
     except Exception as e:
         print("요약 실패", e)
 
-if today_cnt >= MAX_ALERTS: print("상한"); raise SystemExit(0)
-if streak_loss >= 2: print("2연패 중단"); raise SystemExit(0)
-if HHMM >= 1430: print("14:30 이후 신규 알람 중단"); raise SystemExit(0)
 
 # ── 당일 시계열 구축 ──
 snaps = sorted(f for f in os.listdir("data/snaps") if f.startswith(TODAY))
 reg = [f for f in snaps if int(f[9:13]) >= 900]
-if len(reg) < 5:
-    print(f"스냅샷 {len(reg)}개 - 패턴 판별에 5개 필요"); raise SystemExit(0)
-
 def tmin(f): return int(f[9:11]) * 60 + int(f[11:13])
 series = defaultdict(list)
 for f in reg:
     try:
-        s = pd.read_csv(f"data/snaps/{f}", dtype={"code": str})
+        s_ = pd.read_csv(f"data/snaps/{f}", dtype={"code": str})
         t = tmin(f)
-        for c_, p_, v_ in zip(s["code"], s["종가"], s["거래대금"]):
+        for c_, p_, v_ in zip(s_["code"], s_["종가"], s_["거래대금"]):
             if not pd.isna(p_): series[c_].append((t, float(p_), float(v_) if not pd.isna(v_) else 0))
     except Exception: pass
+
+SENT = "data/sent.json"; sent = {}
+if os.path.exists(SENT):
+    try: sent = json.load(open(SENT))
+    except Exception: sent = {}
+sent = {k: v for k, v in sent.items() if isinstance(v, dict) and str(v.get("t", "")).startswith(TODAY)}
+vw = dict(zip(cur["code"], cur["거래대금"] / cur["거래량"].replace(0, float("nan"))))
+
+def accel(code):
+    """최근 스냅 구간 분당거래대금 ÷ 당일 평균 분당거래대금"""
+    seq = series.get(code, [])
+    if len(seq) < 3: return 0.0
+    (t0, _, v0), (t1, _, v1), (t2, _, v2) = seq[0], seq[-2], seq[-1]
+    recent = (v2 - v1) / max(t2 - t1, 1)
+    avg = (v2 - v0) / max(t2 - t0, 1)
+    return recent / max(avg, 1)
+
+# ── 섹터 발동 → 후발주 탐지 ──
+THEMES = "data/themes.csv"
+active_ctx = {}          # code -> "테마 · 대장 A +12% · 3등"
+theme_alerts = []
+if os.path.exists(THEMES) and len(reg) >= 3 and HHMM < 1430:
+    try:
+        th = pd.read_csv(THEMES, dtype={"code": str, "no": str})
+        px = cur.set_index("code")
+        th = th[th["code"].isin(px.index)]
+        groups = []
+        for (kind, no, gname), g in th.groupby(["kind", "no", "group"]):
+            codes = list(g["code"])
+            if not (3 <= len(codes) <= 60): continue
+            m = px.loc[codes].sort_values("등락률", ascending=False)
+            big = m[m["거래대금"] >= 1e10]
+            if big.empty: continue
+            lead = big.iloc[0]; lp = lead["등락률"]
+            if lp < 7: continue
+            up = m[m["등락률"] >= 3]
+            breadth = (m["등락률"] >= 2).mean()
+            if len(up) < 3 or breadth < 0.3: continue
+            rank = {c: i + 1 for i, c in enumerate(m.index)}
+            for c in m.index[:5]:
+                if m.loc[c, "등락률"] >= 1:
+                    active_ctx.setdefault(c, f"🏷 {gname} · 대장 {lead['name']} {lp:+.0f}% · {rank[c]}등")
+            groups.append({"kind": kind, "no": no, "name": gname, "lead": lead, "m": m,
+                           "score": lp + breadth * 20 + len(up)})
+        groups.sort(key=lambda x: -x["score"])
+        print(f"발동 섹터 {len(groups)}: " + ", ".join(g['name'] for g in groups[:5]))
+        theme_today = sum(1 for v in sent.values() if v.get("kind") == "후발주")
+        for g in groups:
+            if len(theme_alerts) + theme_today >= MAX_THEME: break
+            if f"T:{g['kind']}{g['no']}" in sent: continue
+            lead, m = g["lead"], g["m"]
+            fol = []
+            for c, r in m.iterrows():
+                if c == lead.name or c in sent: continue
+                if not (1 <= r["등락률"] <= lead["등락률"] * 0.5): continue
+                if r["거래대금"] < 1e9: continue
+                v_ = vw.get(c)
+                if v_ is None or pd.isna(v_) or r["종가"] < v_: continue
+                ac = accel(c)
+                if ac < 1.5: continue
+                fol.append((c, r, ac))
+            fol.sort(key=lambda x: -x[1]["거래대금"])
+            if not fol: continue
+            theme_alerts.append((g, fol[:3]))
+            sent[f"T:{g['kind']}{g['no']}"] = {"t": STAMP, "kind": "테마"}
+            for c, r, ac in fol[:3]: sent[c] = {"t": STAMP, "kind": "후발주"}
+    except Exception as e:
+        print("섹터 실패", e)
+
+if theme_alerts:
+    lines = [f"🔥 <b>{NOW.strftime('%H:%M')} 섹터 발동</b>  코스닥 {KQ:+.1f}%" + (" ⚠️약세" if WEAK else "")]
+    rows_ = []
+    for g, fol in theme_alerts:
+        lead, m = g["lead"], g["m"]
+        upn = int((m["등락률"] >= 3).sum())
+        lines += ["", f"🏷 <b>{g['name']}</b>  {upn}/{len(m)} 종목 +3%↑",
+                  f"  👑 대장 {link(lead.name, lead['name'])} {lead['등락률']:+.1f}% · {lead['거래대금']/1e8:.0f}억"]
+        for c, r, ac in fol:
+            p = r["종가"]; sl, t1, t2 = p * 0.97, p * 1.05, p * 1.10
+            lines.append(f"  ➡️ {link(c, r['name'])} {r['등락률']:+.1f}% · 거래 가속 ×{ac:.1f} · VWAP위 ✅"
+                         f"\n     🛑 {int(sl):,}  💰 {int(t1):,}  💎 {int(t2):,}")
+            rows_.append({"시각": STAMP, "유형": "후발주", "code": c, "name": r["name"], "알람가": p,
+                          "손절": round(sl), "목표1": round(t1), "목표2": round(t2), "손익비": 1.7,
+                          "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
+                          "당일등락": r["등락률"], "30분": None, "60분": None,
+                          "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""})
+    tg("\n".join(lines)); print("섹터 알람", len(theme_alerts))
+    nt = pd.DataFrame(rows_)
+    if os.path.exists(TRACK):
+        try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
+        except Exception: pass
+    nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
+    json.dump(sent, open(SENT, "w"))
+
+if today_cnt >= MAX_ALERTS: print("상한"); raise SystemExit(0)
+if streak_loss >= 2: print("2연패 중단"); raise SystemExit(0)
+if HHMM >= 1430: print("14:30 이후 신규 알람 중단"); raise SystemExit(0)
+
+if len(reg) < 5:
+    print(f"스냅샷 {len(reg)}개 - 패턴 판별에 5개 필요"); json.dump(sent, open(SENT, "w")); raise SystemExit(0)
 
 # ── 눌림목 돌파 탐지 ──
 def detect(seq):
@@ -263,7 +358,6 @@ def detect(seq):
     return {"hi": hi_p, "lo": lo_p, "rb": rb_p, "dd": dd, "corr_min": lo_t - hi_t,
             "since_lo": cur_t - lo_t, "recent_pm": recent, "vol_ratio": recent / max(corr, 1)}
 
-vw = dict(zip(cur["code"], cur["거래대금"] / cur["거래량"].replace(0, float("nan"))))
 uni_map = uni.set_index("code")
 cands = []
 for _, r in cur.iterrows():
@@ -286,12 +380,6 @@ for _, r in cur.iterrows():
     if rr1 < (1.5 if WEAK else 1.0): continue
     cands.append({"r": r, "d": d, "rise": rise_pct, "sl": sl, "rr1": rr1, "vwap": v_})
 print(f"패턴 후보 {len(cands)}")
-
-SENT = "data/sent.json"; sent = {}
-if os.path.exists(SENT):
-    try: sent = json.load(open(SENT))
-    except Exception: sent = {}
-sent = {k: v for k, v in sent.items() if isinstance(v, dict) and str(v.get("t", "")).startswith(TODAY)}
 
 cands.sort(key=lambda x: -x["rr1"])
 picked = []
@@ -322,6 +410,7 @@ if picked:
         t += f"\n  💰 1차 {int(d['hi']):,} ({(d['hi']/p-1)*100:+.1f}% · 1:{c['rr1']:.1f})"
         if c["res2"]:
             t += f"\n  💎 2차 {int(c['res2']):,} ({(c['res2']/p-1)*100:+.1f}% · 1:{c['rr2']:.1f})"
+        if code in active_ctx: t += f"\n  {active_ctx[code]}"
         for n in c["news"]: t += f"\n  📰 {n}"
         blocks.append(t)
         sent[code] = {"t": STAMP, "kind": "눌림돌파"}
