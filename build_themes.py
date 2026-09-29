@@ -1,73 +1,87 @@
 """
-테마 매핑 빌더 - 네이버 금융 테마/업종 → 종목 테이블 생성
+테마 매핑 빌더 - 네이버 증권 새 JSON API
 결과: data/themes.csv  (kind, no, group, code, name)
-universe.yml 에서 build_universe.py 다음에 실행.
 """
-import requests, pandas as pd, re, os, time, sys
+import requests, pandas as pd, os, time, sys, json
 
-H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-     "Referer": "https://finance.naver.com/sise/"}
-BASE = "https://finance.naver.com"
+BASE = "https://stock.naver.com"
+H = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+     "Referer": "https://stock.naver.com/", "Accept": "application/json"}
+DEBUG = {"n": 0}
 
-def html(url):
+def get(path):
     for _ in range(3):
         try:
-            r = requests.get(url, headers=H, timeout=15)
+            r = requests.get(BASE + path, headers=H, timeout=15)
             if r.status_code == 200:
-                return r.content.decode("cp949", "ignore")
-            if r.status_code in (403, 429):
-                print("차단?", r.status_code, url); return None
+                try: return r.json()
+                except Exception:
+                    print("JSON 아님", path, r.text[:150]); return None
+            print("HTTP", r.status_code, path, r.text[:150])
+            if r.status_code in (403, 404, 429): return None
         except Exception as e:
             print("재시도", e)
         time.sleep(1.5)
     return None
 
-RE_GROUP = re.compile(r'sise_group_detail\.naver\?type=(theme|upjong)&(?:amp;)?no=(\d+)"[^>]*>\s*([^<]+?)\s*</a>')
-RE_STOCK = re.compile(r'/item/main\.naver\?code=(\d{6})"[^>]*>\s*([^<]+?)\s*</a>')
+def as_list(j):
+    if isinstance(j, list): return j
+    if isinstance(j, dict):
+        for k in ("content", "stocks", "items", "result", "list", "datas"):
+            v = j.get(k)
+            if isinstance(v, list): return v
+            if isinstance(v, dict):
+                inner = as_list(v)
+                if inner: return inner
+    return []
 
-def group_list(kind):
-    seen, out = set(), []
-    if kind == "theme":
-        for page in range(1, 12):
-            t = html(f"{BASE}/sise/theme.naver?&page={page}")
-            if not t: break
-            found = [(k, n, nm) for k, n, nm in RE_GROUP.findall(t) if k == "theme" and n not in seen]
-            if not found: break
-            for k, n, nm in found:
-                seen.add(n); out.append((n, nm.strip()))
-            time.sleep(0.4)
-    else:
-        t = html(f"{BASE}/sise/sise_group.naver?type=upjong")
-        if t:
-            for k, n, nm in RE_GROUP.findall(t):
-                if k == "upjong" and n not in seen:
-                    seen.add(n); out.append((n, nm.strip()))
-    print(kind, "그룹", len(out))
-    return out
+def pick(d, keys):
+    for k in keys:
+        if d.get(k) not in (None, ""): return str(d[k]).strip()
+    return None
 
-def members(kind, no):
-    t = html(f"{BASE}/sise/sise_group_detail.naver?type={kind}&no={no}")
-    if not t: return []
-    seen, out = set(), []
-    for code, name in RE_STOCK.findall(t):
-        if code not in seen:
-            seen.add(code); out.append((code, name.strip().rstrip("*").strip()))
+def paged(path_fmt, size):
+    """startIdx 가 페이지번호/오프셋 어느 쪽이든 새 항목이 없을 때까지 수집"""
+    out, seen = [], set()
+    for idx in range(0, 30):
+        items = as_list(get(path_fmt.format(idx=idx, size=size)))
+        new = 0
+        for it in items:
+            key = json.dumps(it, sort_keys=True, ensure_ascii=False)[:200]
+            if key in seen: continue
+            seen.add(key); out.append(it); new += 1
+        if DEBUG["n"] < 2 and items:
+            print("  샘플 키:", list(items[0].keys())[:15]); DEBUG["n"] += 1
+        if new == 0 or len(items) < size: break
+        time.sleep(0.3)
     return out
 
 rows = []
 for kind in ("theme", "upjong"):
-    for no, gname in group_list(kind):
-        m = members(kind, no)
-        for code, name in m:
-            rows.append({"kind": kind, "no": no, "group": gname, "code": code, "name": name})
-        time.sleep(0.35)
+    groups = paged(f"/api/domestic/market/{kind}/list?startIdx={{idx}}&pageSize={{size}}&sortType=changeRate", 100)
+    gl = []
+    for g in groups:
+        no = pick(g, ("no", "themeNo", "upjongNo", "groupNo", "code"))
+        nm = pick(g, ("name", "themeName", "upjongName", "groupName"))
+        if no and nm and (no, nm) not in gl: gl.append((no, nm))
+    print(kind, "그룹", len(gl))
+    DEBUG["n"] = 0
+    for no, gname in gl:
+        mem = paged(f"/api/domestic/market/{kind}/{no}/stocklist?marketType=ALL&orderType=quantTop"
+                    f"&startIdx={{idx}}&pageSize={{size}}", 100)
+        for s in mem:
+            code = pick(s, ("itemCode", "itemcode", "code", "stockCode", "reutersCode"))
+            name = pick(s, ("stockName", "itemName", "itemname", "name"))
+            if code and len(code) == 6:
+                rows.append({"kind": kind, "no": no, "group": gname, "code": code.upper(), "name": name})
+        time.sleep(0.25)
 
 if not rows:
     print("테마 수집 실패 - 기존 파일 유지"); sys.exit(0)
 
 df = pd.DataFrame(rows).drop_duplicates(subset=["kind", "no", "code"])
-df = df[df["code"].str[-1] == "0"]                       # 우선주 제외
+df = df[df["code"].str[-1] == "0"]
 os.makedirs("data", exist_ok=True)
 df.to_csv("data/themes.csv", index=False, encoding="utf-8-sig")
 print("저장", len(df), "행 ·", df.groupby("kind")["no"].nunique().to_dict())
