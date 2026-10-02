@@ -34,8 +34,8 @@ jobs:
 
       - name: 브리핑 생성·발송
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN || secrets.BOT_TOKEN || secrets.TG_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
           NO_WAIT: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: python briefing.py
