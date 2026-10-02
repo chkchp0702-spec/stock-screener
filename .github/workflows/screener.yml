@@ -3,8 +3,8 @@ name: screener
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0,10,20,30,40,50 23 * * 0-4"
-    - cron: "0,10,20,30,40,50 0-6 * * 1-5"
+    - cron: "55 23 * * 0-4"   # 08:55 KST 오전 세션 (cron-job.org 누락 대비)
+    - cron: "5 3 * * 1-5"     # 12:05 KST 오후 세션 (오전 세션 자기 호출 누락 대비)
 
 permissions:
   contents: write
@@ -17,36 +17,38 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install requests pandas
+      - run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
       - run: python screener.py
         continue-on-error: true
         env:
+          LOOP: "1"
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
       - name: commit results
         if: always()
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          git add -A data/
+          git diff --staged --quiet || git commit -m "scan $(TZ=Asia/Seoul date +%H:%M)"
           git pull --rebase || true
-          git add data/
-          git diff --staged --quiet || git commit -m "scan $(date +%H:%M)"
-          git push
-      - name: next run
+          git push || true
+      - name: afternoon session
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          H=$(TZ=Asia/Seoul date +%H)
+          H=$(TZ=Asia/Seoul date +%H%M)
           D=$(TZ=Asia/Seoul date +%u)
-          if [ "$D" -le 5 ] && [ "$H" -ge 8 ] && [ "$H" -lt 15 ]; then
-            sleep 480
+          if [ "$D" -le 5 ] && [ "$H" -ge 1150 ] && [ "$H" -lt 1230 ]; then
             gh workflow run screener.yml --repo ${{ github.repository }}
           else
-            echo "장 시간 외"
+            echo "오후 세션 호출 없음"
           fi
