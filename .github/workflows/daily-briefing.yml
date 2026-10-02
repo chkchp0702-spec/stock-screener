@@ -1,0 +1,49 @@
+name: daily-briefing
+
+on:
+  schedule:
+    - cron: "50 22 * * 0-4"
+    - cron: "15 23 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "휴장일·중복 체크 무시하고 바로 발송"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-briefing
+  cancel-in-progress: false
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 패키지 설치
+        run: pip install -q yfinance pandas numpy pyyaml requests holidays
+
+      - name: 브리핑 생성·발송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN || secrets.BOT_TOKEN || secrets.TG_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
+          NO_WAIT: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: python briefing.py
+
+      - name: 기록 저장
+        if: always()
+        run: |
+          git config user.name "briefing-bot"
+          git config user.email "briefing-bot@users.noreply.github.com"
+          git add briefing_data/ 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "daily briefing $(TZ=Asia/Seoul date +%F)" && git pull --rebase -q && git push)
