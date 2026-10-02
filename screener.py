@@ -1,22 +1,38 @@
-import requests, pandas as pd, os, time, json, html
-from collections import Counter, defaultdict
+import requests, pandas as pd, os, time, json, html, subprocess, sys
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 KST = timezone(timedelta(hours=9))
-NOW = datetime.now(KST)
-STAMP = NOW.strftime("%Y%m%d_%H%M")
-TODAY = NOW.strftime("%Y%m%d")
-START = (NOW - timedelta(days=150)).strftime("%Y%m%d")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
-HHMM = NOW.hour * 100 + NOW.minute
-PRE = HHMM < 900
 MAX_ALERTS = 5
 MAX_THEME = 3          # 하루 섹터(후발주) 알람 상한
+
+# ── 2026-10-02 조정값 ──
+LOOP = os.environ.get("LOOP", "0") == "1"   # 1이면 한 실행 안에서 1분마다 반복
+INTERVAL = 60                               # 반복 간격(초)
+COMMIT_EVERY = 10                           # 몇 분마다 결과 커밋
+LEAD_HOLD_MIN = 30                          # 대장이 +7% 이상을 유지해야 하는 시간(분) = 2차 파동
+LEAD_PCT = 7
+FOL_MAX_PCT = 4.0                           # 후발주 등락 상한(절대)
+FOL_MAX_RATIO = 0.35                        # 후발주 등락 상한(대장 대비)
+LEAD_VAL_SMALL, LEAD_VAL_BIG = 1e10, 3e10   # 대장 거래대금 하한 (그룹 30개 이하 / 초과)
+FOL_SL, FOL_T1, FOL_T2 = 0.975, 1.03, 1.06  # 후발주 손절 -2.5% / 1차 +3% / 2차 +6%
+BROAD = ["지주", "밸류업", "배당", "기타", "신규상장", "코스피", "코스닥", "KRX", "MSCI", "지수", "우량"]
+SNAP_KEEP_DAYS = 7                          # 스냅샷 보관 일수
 
 H = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
      "Referer": "https://m.stock.naver.com/", "Accept": "application/json"}
+
+NOW = STAMP = TODAY = START = HHMM = None
+def set_clock():
+    global NOW, STAMP, TODAY, START, HHMM
+    NOW = datetime.now(KST)
+    STAMP = NOW.strftime("%Y%m%d_%H%M")
+    TODAY = NOW.strftime("%Y%m%d")
+    START = (NOW - timedelta(days=150)).strftime("%Y%m%d")
+    HHMM = NOW.hour * 100 + NOW.minute
 
 def get(url, timeout=10):
     try:
@@ -97,335 +113,415 @@ def fetch(mkt):
         empty = 0; rows += items; page += 1; time.sleep(0.2)
     return rows
 
-# ── 수집 ──
-rows = []
-for mk in ["KOSPI", "KOSDAQ"]:
-    rows += fetch(mk)
-uni = pd.read_csv("data/universe_latest.csv", dtype={"code": str})
-uni = uni.rename(columns={"거래대금": "전일거래대금", "시가총액": "시총", "등락률": "전일등락"})
-df = pd.DataFrame(rows).drop_duplicates(subset=["itemCode"])
-num = lambda s: pd.to_numeric(s.astype(str).str.replace(",", ""), errors="coerce")
-df = df.rename(columns={"itemCode": "code", "stockName": "name"})
-df = df[df["code"].isin(set(uni["code"]))].copy()
-df["종가"] = num(df["closePriceRaw"]); df["등락률"] = num(df["fluctuationsRatio"])
-df["거래대금"] = num(df["accumulatedTradingValueRaw"])
-df["거래량"] = num(df["accumulatedTradingVolumeRaw"])
-cur = df[["code", "name", "종가", "등락률", "거래대금", "거래량"]]
-print(f"{STAMP} | {len(cur)}종목")
-os.makedirs("data/snaps", exist_ok=True)
-cur.to_csv(f"data/snaps/{STAMP}.csv", index=False, encoding="utf-8-sig")
-KQ = kosdaq_pct()
+def flag_of(v):
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) or str(v) == "nan" else str(v)
 
-if PRE:
-    print("프리마켓 - 네이버 NXT 미지원, 스냅샷만 저장"); raise SystemExit(0)
-
-up_ratio = (cur["등락률"] > 0).mean() * 100
-WEAK = KQ <= -1.0 or up_ratio < 40
-print(f"코스닥 {KQ:+.2f}% · 상승 {up_ratio:.0f}%" + (" · 약세" if WEAK else ""))
-
-# ── 추적 갱신 + 청산 ──
-TRACK = "data/tracking.csv"
-COLS = ["시각","유형","code","name","알람가","손절","목표1","목표2","손익비","VWAP위",
-        "코스닥","상승비율","당일등락","30분","60분","최고","최저","현재","청산알림"]
-streak_loss, today_cnt, exits = 0, 0, []
-if os.path.exists(TRACK):
+def sim_pct(x):
+    """손절·1차익절 규칙대로 청산했다고 가정한 수익률"""
     try:
-        tr = pd.read_csv(TRACK, dtype={"code": str})
-        for c in COLS:
-            if c not in tr.columns: tr[c] = None
-        px = dict(zip(cur["code"], cur["종가"]))
-        for i, row in tr.iterrows():
-            p = px.get(row["code"])
-            if p is None or pd.isna(row.get("알람가")): continue
-            t0 = datetime.strptime(str(row["시각"]), "%Y%m%d_%H%M").replace(tzinfo=KST)
-            mins = (NOW - t0).total_seconds() / 60
-            chg = (p / row["알람가"] - 1) * 100
-            if mins >= 30 and pd.isna(row.get("30분")): tr.at[i, "30분"] = round(chg, 2)
-            if mins >= 60 and pd.isna(row.get("60분")): tr.at[i, "60분"] = round(chg, 2)
-            if str(row["시각"]).startswith(TODAY):
-                pm, lm = row.get("최고"), row.get("최저")
-                tr.at[i, "최고"] = round(max(chg, pm if not pd.isna(pm) else -99), 2)
-                tr.at[i, "최저"] = round(min(chg, lm if not pd.isna(lm) else 99), 2)
-                tr.at[i, "현재"] = round(chg, 2)
-                flag = str(row.get("청산알림") or "")
-                t1, t2, sl = row.get("목표1"), row.get("목표2"), row.get("손절")
-                if t2 and not pd.isna(t2) and p >= float(t2) and "2차" not in flag:
-                    exits.append(("2차목표", row, p, chg)); flag += "2차"
-                elif t1 and not pd.isna(t1) and p >= float(t1) and "1차" not in flag:
-                    exits.append(("1차목표", row, p, chg)); flag += "1차"
-                elif sl and not pd.isna(sl) and p <= float(sl) and "손절" not in flag:
-                    exits.append(("손절", row, p, chg)); flag += "손절"
-                tr.at[i, "청산알림"] = flag
-        tr.to_csv(TRACK, index=False, encoding="utf-8-sig")
-        tt = tr[tr["시각"].astype(str).str.startswith(TODAY)]
-        today_cnt = int((tt["유형"] != "후발주").sum())   # 후발주는 별도 상한
-        for v in reversed(list(tt.dropna(subset=["30분"]).sort_values("시각")["30분"])):
-            if v < 0: streak_loss += 1
-            else: break
+        sl = (float(x["손절"]) / x["알람가"] - 1) * 100
+        t1 = (float(x["목표1"]) / x["알람가"] - 1) * 100
+        if x["최저"] <= sl: return sl
+        if x["최고"] >= t1: return t1
+        return x["현재"]
+    except Exception:
+        return x["현재"]
+
+def git_commit():
+    try:
+        subprocess.run(["git", "add", "-A", "data/"], check=False)
+        r = subprocess.run(["git", "diff", "--staged", "--quiet"])
+        if r.returncode == 0: return
+        subprocess.run(["git", "commit", "-q", "-m", f"scan {NOW.strftime('%H:%M')}"], check=False)
+        subprocess.run(["git", "pull", "--rebase", "-q"], check=False)
+        subprocess.run(["git", "push", "-q"], check=False)
+        print("커밋", NOW.strftime("%H:%M"))
     except Exception as e:
-        print("추적 실패", e)
-print(f"오늘 {today_cnt}건 · 연패 {streak_loss}")
+        print("커밋 실패", e)
 
-if exits:
-    lines = [f"🔔 <b>{NOW.strftime('%H:%M')} 청산</b>", ""]
-    for kind, row, p, chg in exits[:6]:
-        icon = {"1차목표": "💰", "2차목표": "💎", "손절": "🛑"}[kind]
-        lines.append(f"{icon} <b>{kind}</b> {link(row['code'], row['name'])}\n  {int(p):,}원 · {chg:+.1f}%")
-    tg("\n".join(lines))
-
-# ── 마감 요약 ──
-DONE = "data/summary_done.txt"
-if NOW.hour >= 15 and (open(DONE).read().strip() if os.path.exists(DONE) else "") != TODAY:
+def prune_snaps():
     try:
-        lines = [f"📊 <b>{NOW.strftime('%m/%d')} 마감</b>  코스닥 {KQ:+.1f}% · 상승 {up_ratio:.0f}%"]
-        alerted = set()
-        if os.path.exists(TRACK):
-            tr = pd.read_csv(TRACK, dtype={"code": str})
-            t = tr[tr["시각"].astype(str).str.startswith(TODAY)]
-            alerted = set(t["code"])
-            if len(t):
-                sim = []
-                for _, x in t.iterrows():
-                    try:
-                        sl = (float(x["손절"]) / x["알람가"] - 1) * 100
-                        t1 = (float(x["목표1"]) / x["알람가"] - 1) * 100
-                        if x["최저"] <= sl: sim.append(sl)
-                        elif x["최고"] >= t1: sim.append(t1)
-                        else: sim.append(x["현재"])
-                    except Exception: sim.append(x["현재"])
-                win = sum(1 for s in sim if s > 0)
-                lines += [f"알람 {len(t)}건 · 승 {win} 패 {len(t)-win}",
-                          f"💼 시뮬(손절·1차익절) 평균 <b>{sum(sim)/len(sim):+.2f}%</b> · 종가 평균 {t['현재'].mean():+.2f}%", ""]
-                for _, x in t.iterrows():
-                    lines.append(f"  {x['name']} 최고 {x['최고']:+.1f}% 최저 {x['최저']:+.1f}% → {x['현재']:+.1f}%")
-            else:
-                lines.append("알람 없음 (조건 충족 종목 없음)")
-        missed = cur[(cur["등락률"] >= 8) & (~cur["code"].isin(alerted)) & (cur["거래대금"] >= 5e9)]
-        if len(missed):
-            lines += ["", "😶 놓친 급등주: " + ", ".join(f"{x['name']} {x['등락률']:+.0f}%" for _, x in missed.head(5).iterrows())]
-        tg("\n".join(lines)); open(DONE, "w").write(TODAY)
-    except Exception as e:
-        print("요약 실패", e)
-
-
-# ── 당일 시계열 구축 ──
-snaps = sorted(f for f in os.listdir("data/snaps") if f.startswith(TODAY))
-reg = [f for f in snaps if int(f[9:13]) >= 900]
-def tmin(f): return int(f[9:11]) * 60 + int(f[11:13])
-series = defaultdict(list)
-for f in reg:
-    try:
-        s_ = pd.read_csv(f"data/snaps/{f}", dtype={"code": str})
-        t = tmin(f)
-        for c_, p_, v_ in zip(s_["code"], s_["종가"], s_["거래대금"]):
-            if not pd.isna(p_): series[c_].append((t, float(p_), float(v_) if not pd.isna(v_) else 0))
+        cut = (datetime.now(KST) - timedelta(days=SNAP_KEEP_DAYS)).strftime("%Y%m%d")
+        for f in os.listdir("data/snaps"):
+            if f[:8] < cut: os.remove(f"data/snaps/{f}")
     except Exception: pass
 
-SENT = "data/sent.json"; sent = {}
-if os.path.exists(SENT):
-    try: sent = json.load(open(SENT))
-    except Exception: sent = {}
-sent = {k: v for k, v in sent.items() if isinstance(v, dict) and str(v.get("t", "")).startswith(TODAY)}
-vw = dict(zip(cur["code"], cur["거래대금"] / cur["거래량"].replace(0, float("nan"))))
 
-def accel(code):
-    """최근 스냅 구간 분당거래대금 ÷ 당일 평균 분당거래대금"""
-    seq = series.get(code, [])
-    if len(seq) < 3: return 0.0
-    (t0, _, v0), (t1, _, v1), (t2, _, v2) = seq[0], seq[-2], seq[-1]
-    recent = (v2 - v1) / max(t2 - t1, 1)
-    avg = (v2 - v0) / max(t2 - t0, 1)
-    return recent / max(avg, 1)
+def scan():
+    set_clock()
+    # ── 수집 ──
+    rows = []
+    for mk in ["KOSPI", "KOSDAQ"]:
+        rows += fetch(mk)
+    uni = pd.read_csv("data/universe_latest.csv", dtype={"code": str})
+    uni = uni.rename(columns={"거래대금": "전일거래대금", "시가총액": "시총", "등락률": "전일등락"})
+    df = pd.DataFrame(rows).drop_duplicates(subset=["itemCode"])
+    num = lambda s: pd.to_numeric(s.astype(str).str.replace(",", ""), errors="coerce")
+    df = df.rename(columns={"itemCode": "code", "stockName": "name"})
+    df = df[df["code"].isin(set(uni["code"]))].copy()
+    if len(df) < 200:
+        print(f"{STAMP} | 수집 부족 {len(df)}종목 - 건너뜀"); return
+    df["종가"] = num(df["closePriceRaw"]); df["등락률"] = num(df["fluctuationsRatio"])
+    df["거래대금"] = num(df["accumulatedTradingValueRaw"])
+    df["거래량"] = num(df["accumulatedTradingVolumeRaw"])
+    cur = df[["code", "name", "종가", "등락률", "거래대금", "거래량"]]
+    print(f"{STAMP} | {len(cur)}종목")
+    os.makedirs("data/snaps", exist_ok=True)
+    cur.to_csv(f"data/snaps/{STAMP}.csv", index=False, encoding="utf-8-sig")
+    KQ = kosdaq_pct()
 
-# ── 섹터 발동 → 후발주 탐지 ──
-THEMES = "data/themes.csv"
-active_ctx = {}          # code -> "테마 · 대장 A +12% · 3등"
-theme_alerts = []
-if os.path.exists(THEMES) and len(reg) >= 3 and HHMM < 1430:
-    try:
-        th = pd.read_csv(THEMES, dtype={"code": str, "no": str})
-        px = cur.set_index("code")
-        th = th[th["code"].isin(px.index)]
-        groups = []
-        for (kind, no, gname), g in th.groupby(["kind", "no", "group"]):
-            codes = list(g["code"])
-            if not (3 <= len(codes) <= 120): continue
-            m = px.loc[codes].sort_values("등락률", ascending=False)
-            big = m[m["거래대금"] >= 1e10]
-            if big.empty: continue
-            lead = big.iloc[0]; lp = lead["등락률"]
-            if lp < 7: continue
-            up = m[m["등락률"] >= 3]
-            breadth = (m["등락률"] >= 2).mean()
-            if len(up) < 3 or breadth < 0.3: continue
-            rank = {c: i + 1 for i, c in enumerate(m.index)}
-            for c in m.index[:5]:
-                if m.loc[c, "등락률"] >= 1:
-                    active_ctx.setdefault(c, f"🏷 {gname} · 대장 {lead['name']} {lp:+.0f}% · {rank[c]}등")
-            groups.append({"kind": kind, "no": no, "name": gname, "lead": lead, "m": m,
-                           "score": lp + breadth * 20 + len(up)})
-        groups.sort(key=lambda x: -x["score"])
-        print(f"발동 섹터 {len(groups)}: " + ", ".join(g['name'] for g in groups[:5]))
-        theme_today = sum(1 for v in sent.values() if v.get("kind") == "후발주")
-        for g in groups:
-            if len(theme_alerts) + theme_today >= MAX_THEME: break
-            if f"T:{g['kind']}{g['no']}" in sent: continue
-            lead, m = g["lead"], g["m"]
-            fol = []
-            for c, r in m.iterrows():
-                if c == lead.name or c in sent: continue
-                if not (1 <= r["등락률"] <= lead["등락률"] * 0.5): continue
-                if r["거래대금"] < 1e9: continue
-                v_ = vw.get(c)
-                if v_ is None or pd.isna(v_) or r["종가"] < v_: continue
-                ac = accel(c)
-                if ac < 1.5: continue
-                fol.append((c, r, ac))
-            fol.sort(key=lambda x: -x[1]["거래대금"])
-            if not fol: continue
-            theme_alerts.append((g, fol[:3]))
-            sent[f"T:{g['kind']}{g['no']}"] = {"t": STAMP, "kind": "테마"}
-            for c, r, ac in fol[:3]: sent[c] = {"t": STAMP, "kind": "후발주"}
-    except Exception as e:
-        print("섹터 실패", e)
+    if HHMM < 900:
+        print("09:00 전 - 스냅샷만 저장"); return
 
-if theme_alerts:
-    lines = [f"🔥 <b>{NOW.strftime('%H:%M')} 섹터 발동</b>  코스닥 {KQ:+.1f}%" + (" ⚠️약세" if WEAK else "")]
-    rows_ = []
-    for g, fol in theme_alerts:
-        lead, m = g["lead"], g["m"]
-        upn = int((m["등락률"] >= 3).sum())
-        lines += ["", f"🏷 <b>{g['name']}</b>  {upn}/{len(m)} 종목 +3%↑",
-                  f"  👑 대장 {link(lead.name, lead['name'])} {lead['등락률']:+.1f}% · {lead['거래대금']/1e8:.0f}억"]
-        for c, r, ac in fol:
-            p = r["종가"]; sl, t1, t2 = p * 0.97, p * 1.05, p * 1.10
-            lines.append(f"  ➡️ {link(c, r['name'])} {r['등락률']:+.1f}% · 거래 가속 ×{ac:.1f} · VWAP위 ✅"
-                         f"\n     🛑 {int(sl):,}  💰 {int(t1):,}  💎 {int(t2):,}")
-            rows_.append({"시각": STAMP, "유형": "후발주", "code": c, "name": r["name"], "알람가": p,
-                          "손절": round(sl), "목표1": round(t1), "목표2": round(t2), "손익비": 1.7,
-                          "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
-                          "당일등락": r["등락률"], "30분": None, "60분": None,
-                          "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""})
-    tg("\n".join(lines)); print("섹터 알람", len(theme_alerts))
-    nt = pd.DataFrame(rows_)
+    up_ratio = (cur["등락률"] > 0).mean() * 100
+    WEAK = KQ <= -1.0 or up_ratio < 40
+    print(f"코스닥 {KQ:+.2f}% · 상승 {up_ratio:.0f}%" + (" · 약세" if WEAK else ""))
+
+    # ── 추적 갱신 + 청산 ──
+    TRACK = "data/tracking.csv"
+    COLS = ["시각","유형","code","name","알람가","손절","목표1","목표2","손익비","VWAP위",
+            "코스닥","상승비율","당일등락","30분","60분","최고","최저","현재","청산알림"]
+    streak_loss, today_cnt, exits = 0, 0, []
     if os.path.exists(TRACK):
-        try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
+        try:
+            tr = pd.read_csv(TRACK, dtype={"code": str})
+            for c in COLS:
+                if c not in tr.columns: tr[c] = None
+            px = dict(zip(cur["code"], cur["종가"]))
+            for i, row in tr.iterrows():
+                p = px.get(row["code"])
+                if p is None or pd.isna(row.get("알람가")): continue
+                t0 = datetime.strptime(str(row["시각"]), "%Y%m%d_%H%M").replace(tzinfo=KST)
+                mins = (NOW - t0).total_seconds() / 60
+                chg = (p / row["알람가"] - 1) * 100
+                if mins >= 30 and pd.isna(row.get("30분")): tr.at[i, "30분"] = round(chg, 2)
+                if mins >= 60 and pd.isna(row.get("60분")): tr.at[i, "60분"] = round(chg, 2)
+                if str(row["시각"]).startswith(TODAY):
+                    pm, lm = row.get("최고"), row.get("최저")
+                    tr.at[i, "최고"] = round(max(chg, pm if not pd.isna(pm) else -99), 2)
+                    tr.at[i, "최저"] = round(min(chg, lm if not pd.isna(lm) else 99), 2)
+                    tr.at[i, "현재"] = round(chg, 2)
+                    flag = flag_of(row.get("청산알림"))
+                    t1, t2, sl = row.get("목표1"), row.get("목표2"), row.get("손절")
+                    if t2 and not pd.isna(t2) and p >= float(t2) and "2차" not in flag:
+                        exits.append(("2차목표", row, p, chg)); flag += "2차"
+                    elif t1 and not pd.isna(t1) and p >= float(t1) and "1차" not in flag:
+                        exits.append(("1차목표", row, p, chg)); flag += "1차"
+                    elif sl and not pd.isna(sl) and p <= float(sl) and "손절" not in flag:
+                        exits.append(("손절", row, p, chg)); flag += "손절"
+                    tr.at[i, "청산알림"] = flag
+            tr.to_csv(TRACK, index=False, encoding="utf-8-sig")
+            tt = tr[tr["시각"].astype(str).str.startswith(TODAY)]
+            today_cnt = int((tt["유형"] != "후발주").sum())   # 후발주는 별도 상한
+            for v in reversed(list(tt.dropna(subset=["30분"]).sort_values("시각")["30분"])):
+                if v < 0: streak_loss += 1
+                else: break
+        except Exception as e:
+            print("추적 실패", e)
+    print(f"오늘 {today_cnt}건 · 연패 {streak_loss}")
+
+    if exits:
+        lines = [f"🔔 <b>{NOW.strftime('%H:%M')} 청산</b>", ""]
+        for kind, row, p, chg in exits[:6]:
+            icon = {"1차목표": "💰", "2차목표": "💎", "손절": "🛑"}[kind]
+            lines.append(f"{icon} <b>{kind}</b> {link(row['code'], row['name'])}\n  {int(p):,}원 · {chg:+.1f}%")
+        tg("\n".join(lines))
+
+    # ── 마감 요약 ──
+    DONE = "data/summary_done.txt"
+    if NOW.hour >= 15 and (open(DONE).read().strip() if os.path.exists(DONE) else "") != TODAY:
+        try:
+            lines = [f"📊 <b>{NOW.strftime('%m/%d')} 마감</b>  코스닥 {KQ:+.1f}% · 상승 {up_ratio:.0f}%"]
+            alerted = set()
+            if os.path.exists(TRACK):
+                tr = pd.read_csv(TRACK, dtype={"code": str})
+                t = tr[tr["시각"].astype(str).str.startswith(TODAY)]
+                alerted = set(t["code"])
+                if len(t):
+                    sim = [sim_pct(x) for _, x in t.iterrows()]
+                    win = sum(1 for s in sim if s > 0)
+                    lines += [f"알람 {len(t)}건 · 승 {win} 패 {len(t)-win}",
+                              f"💼 시뮬(손절·1차익절) 평균 <b>{sum(sim)/len(sim):+.2f}%</b> · 종가 평균 {t['현재'].mean():+.2f}%"]
+                    for kind, g in t.groupby("유형"):
+                        s_ = [sim_pct(x) for _, x in g.iterrows()]
+                        lines.append(f"   {kind} {len(g)}건 · 시뮬 {sum(s_)/len(s_):+.2f}%")
+                    lines.append("")
+                    for _, x in t.iterrows():
+                        lines.append(f"  {x['name']} 최고 {x['최고']:+.1f}% 최저 {x['최저']:+.1f}% → {x['현재']:+.1f}%")
+                else:
+                    lines.append("알람 없음 (조건 충족 종목 없음)")
+            missed = cur[(cur["등락률"] >= 8) & (~cur["code"].isin(alerted)) & (cur["거래대금"] >= 5e9)]
+            if len(missed):
+                lines += ["", "😶 놓친 급등주: " + ", ".join(f"{x['name']} {x['등락률']:+.0f}%" for _, x in missed.head(5).iterrows())]
+            tg("\n".join(lines)); open(DONE, "w").write(TODAY)
+        except Exception as e:
+            print("요약 실패", e)
+
+    # ── 당일 시계열 구축 ──
+    snaps = sorted(f for f in os.listdir("data/snaps") if f.startswith(TODAY))
+    reg = [f for f in snaps if int(f[9:13]) >= 900]
+    def tmin(f): return int(f[9:11]) * 60 + int(f[11:13])
+    series = defaultdict(list)
+    for f in reg:
+        try:
+            s_ = pd.read_csv(f"data/snaps/{f}", dtype={"code": str})
+            t = tmin(f)
+            for c_, p_, v_ in zip(s_["code"], s_["종가"], s_["거래대금"]):
+                if not pd.isna(p_): series[c_].append((t, float(p_), float(v_) if not pd.isna(v_) else 0))
         except Exception: pass
-    nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
+    now_min = NOW.hour * 60 + NOW.minute
+
+    SENT = "data/sent.json"; sent = {}
+    if os.path.exists(SENT):
+        try: sent = json.load(open(SENT))
+        except Exception: sent = {}
+    sent = {k: v for k, v in sent.items() if isinstance(v, dict) and str(v.get("t", "")).startswith(TODAY)}
+    vw = dict(zip(cur["code"], cur["거래대금"] / cur["거래량"].replace(0, float("nan"))))
+
+    def accel(code, window=5):
+        """최근 window분 분당거래대금 ÷ 당일 평균 분당거래대금"""
+        seq = series.get(code, [])
+        if len(seq) < 3: return 0.0
+        t2, _, v2 = seq[-1]
+        j = len(seq) - 2
+        while j > 0 and t2 - seq[j][0] < window: j -= 1
+        t1, _, v1 = seq[j]
+        t0, _, v0 = seq[0]
+        recent = (v2 - v1) / max(t2 - t1, 1)
+        avg = (v2 - v0) / max(t2 - t0, 1)
+        return recent / max(avg, 1)
+
+    def lead_hold(code, pct_now, price_now):
+        """대장이 +LEAD_PCT 이상을 몇 분째 유지 중인지 (중간에 +5% 아래로 빠지면 0)"""
+        seq = series.get(code, [])
+        if len(seq) < 2 or pct_now <= -99: return 0
+        prev_close = price_now / (1 + pct_now / 100)
+        start = None
+        for t, p, _ in seq:
+            pc = (p / prev_close - 1) * 100
+            if pc >= LEAD_PCT and start is None: start = t
+            elif pc < LEAD_PCT - 2: start = None
+        return (now_min - start) if start is not None else 0
+
+    # ── 섹터 발동 → 후발주 탐지 ──
+    THEMES = "data/themes.csv"
+    active_ctx = {}
+    theme_alerts = []
+    if os.path.exists(THEMES) and len(reg) >= 3 and 910 <= HHMM < 1430:
+        try:
+            th = pd.read_csv(THEMES, dtype={"code": str, "no": str})
+            px = cur.set_index("code")
+            th = th[th["code"].isin(px.index)]
+            groups = []
+            for (kind, no, gname), g in th.groupby(["kind", "no", "group"]):
+                if any(b in str(gname) for b in BROAD): continue
+                codes = list(g["code"])
+                if not (3 <= len(codes) <= 120): continue
+                m = px.loc[codes].sort_values("등락률", ascending=False)
+                big = m[m["거래대금"] >= (LEAD_VAL_SMALL if len(codes) <= 30 else LEAD_VAL_BIG)]
+                if big.empty: continue
+                lead = big.iloc[0]; lp = lead["등락률"]
+                if lp < LEAD_PCT: continue
+                up = m[m["등락률"] >= 3]
+                breadth = (m["등락률"] >= 2).mean()
+                if len(up) < 3 or breadth < 0.3: continue
+                hold = lead_hold(lead.name, lp, lead["종가"])
+                rank = {c: i + 1 for i, c in enumerate(m.index)}
+                for c in m.index[:5]:
+                    if m.loc[c, "등락률"] >= 1:
+                        active_ctx.setdefault(c, f"🏷 {gname} · 대장 {lead['name']} {lp:+.0f}% · {rank[c]}등")
+                if hold < LEAD_HOLD_MIN:
+                    print(f"  {gname}: 대장 {lead['name']} {lp:+.1f}% 유지 {hold}분 - 대기"); continue
+                groups.append({"kind": kind, "no": no, "name": gname, "lead": lead, "m": m, "hold": hold,
+                               "score": lp + breadth * 20 + len(up)})
+            groups.sort(key=lambda x: -x["score"])
+            print(f"발동 섹터 {len(groups)}: " + ", ".join(g['name'] for g in groups[:5]))
+            theme_today = sum(1 for v in sent.values() if v.get("kind") == "후발주")
+            for g in groups:
+                if len(theme_alerts) + theme_today >= MAX_THEME: break
+                if f"T:{g['kind']}{g['no']}" in sent: continue
+                lead, m = g["lead"], g["m"]
+                cap = min(FOL_MAX_PCT, lead["등락률"] * FOL_MAX_RATIO)
+                fol = []
+                for c, r in m.iterrows():
+                    if c == lead.name or c in sent: continue
+                    if not (1 <= r["등락률"] <= cap): continue
+                    if r["거래대금"] < 1e9: continue
+                    v_ = vw.get(c)
+                    if v_ is None or pd.isna(v_) or r["종가"] < v_: continue
+                    ac = accel(c)
+                    if ac < 1.5: continue
+                    fol.append((c, r, ac))
+                fol.sort(key=lambda x: -x[1]["거래대금"])
+                if not fol: continue
+                theme_alerts.append((g, fol[:3]))
+                sent[f"T:{g['kind']}{g['no']}"] = {"t": STAMP, "kind": "테마"}
+                for c, r, ac in fol[:3]: sent[c] = {"t": STAMP, "kind": "후발주"}
+        except Exception as e:
+            print("섹터 실패", e)
+
+    if theme_alerts:
+        lines = [f"🔥 <b>{NOW.strftime('%H:%M')} 섹터 발동</b>  코스닥 {KQ:+.1f}%" + (" ⚠️약세" if WEAK else "")]
+        rows_ = []
+        for g, fol in theme_alerts:
+            lead, m = g["lead"], g["m"]
+            upn = int((m["등락률"] >= 3).sum())
+            lines += ["", f"🏷 <b>{g['name']}</b>  {upn}/{len(m)} 종목 +3%↑",
+                      f"  👑 대장 {link(lead.name, lead['name'])} {lead['등락률']:+.1f}% · {lead['거래대금']/1e8:.0f}억 · {g['hold']}분 유지"]
+            for c, r, ac in fol:
+                p = r["종가"]; sl, t1, t2 = p * FOL_SL, p * FOL_T1, p * FOL_T2
+                lines.append(f"  ➡️ {link(c, r['name'])} {r['등락률']:+.1f}% · 거래 가속 ×{ac:.1f} · VWAP위 ✅"
+                             f"\n     🛑 {int(sl):,}  💰 {int(t1):,}  💎 {int(t2):,}")
+                rows_.append({"시각": STAMP, "유형": "후발주", "code": c, "name": r["name"], "알람가": p,
+                              "손절": round(sl), "목표1": round(t1), "목표2": round(t2), "손익비": 1.2,
+                              "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
+                              "당일등락": r["등락률"], "30분": None, "60분": None,
+                              "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""})
+        tg("\n".join(lines)); print("섹터 알람", len(theme_alerts))
+        nt = pd.DataFrame(rows_)
+        if os.path.exists(TRACK):
+            try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
+            except Exception: pass
+        nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
+        json.dump(sent, open(SENT, "w"))
+
+    if today_cnt >= MAX_ALERTS: print("상한"); return
+    if streak_loss >= 2: print("2연패 중단"); return
+    if HHMM >= 1430: print("14:30 이후 신규 알람 중단"); return
+
+    if len(reg) < 5 or HHMM < 920:
+        print(f"스냅샷 {len(reg)}개 - 눌림목 판별 대기"); json.dump(sent, open(SENT, "w")); return
+
+    # ── 눌림목 돌파 탐지 ──
+    def detect(seq):
+        """seq: [(t, price, cumval)] 오름차순. return dict or None"""
+        if len(seq) < 5: return None
+        n = len(seq)
+        cur_t, cur_p, cur_v = seq[-1]
+        prev_p = seq[-2][1]
+        hi_i = max(range(n - 1), key=lambda i: seq[i][1])
+        hi_t, hi_p = seq[hi_i][0], seq[hi_i][1]
+        if hi_i >= n - 3: return None
+        lo_i = min(range(hi_i + 1, n - 1), key=lambda i: seq[i][1])
+        lo_t, lo_p = seq[lo_i][0], seq[lo_i][1]
+        dd = (lo_p / hi_p - 1) * 100
+        if not (-9 <= dd <= -2.5): return None
+        if lo_t - hi_t < 15: return None                     # 조정 최소 15분
+        if lo_i >= n - 2: return None
+        rb_i = max(range(lo_i + 1, n - 1), key=lambda i: seq[i][1])
+        rb_p = seq[rb_i][1]
+        if rb_p >= hi_p * 0.995: return None
+        if rb_p < lo_p * 1.005: return None
+        if not (prev_p <= rb_p * 1.002 and cur_p > rb_p * 1.003): return None
+        if cur_p >= hi_p * 0.995: return None
+        def pm(i, j):
+            dt = max(seq[j][0] - seq[i][0], 1); return (seq[j][2] - seq[i][2]) / dt
+        k = n - 2
+        while k > 0 and cur_t - seq[k][0] < 5: k -= 1      # 최근 5분 구간
+        recent = pm(k, n - 1)
+        corr = pm(hi_i, lo_i) if lo_i > hi_i else 1
+        rise = pm(0, hi_i) if hi_i > 0 else recent
+        if recent < corr * 1.3: return None
+        if recent < rise * 0.5: return None
+        return {"hi": hi_p, "lo": lo_p, "rb": rb_p, "dd": dd, "corr_min": lo_t - hi_t,
+                "since_lo": cur_t - lo_t, "recent_pm": recent, "vol_ratio": recent / max(corr, 1)}
+
+    cands = []
+    for _, r in cur.iterrows():
+        code = r["code"]
+        seq = series.get(code, [])
+        if len(seq) < 5 or seq[-1][1] != r["종가"]: continue
+        d = detect(seq)
+        if not d: continue
+        prev_close = r["종가"] / (1 + r["등락률"] / 100) if r["등락률"] > -99 else None
+        if not prev_close: continue
+        rise_pct = (d["hi"] / prev_close - 1) * 100
+        if rise_pct < 4: continue
+        if r["거래대금"] < 3e9: continue
+        v_ = vw.get(code)
+        if v_ is None or pd.isna(v_) or r["종가"] < v_: continue
+        sl = d["lo"] * 0.995
+        risk = r["종가"] - sl
+        rew1 = d["hi"] - r["종가"]
+        rr1 = rew1 / risk if risk > 0 else 0
+        if rr1 < (1.5 if WEAK else 1.0): continue
+        cands.append({"r": r, "d": d, "rise": rise_pct, "sl": sl, "rr1": rr1, "vwap": v_})
+    print(f"패턴 후보 {len(cands)}")
+
+    cands.sort(key=lambda x: -x["rr1"])
+    picked = []
+    for c in cands:
+        if today_cnt + len(picked) >= MAX_ALERTS: break
+        r, d = c["r"], c["d"]; code = r["code"]
+        if code in sent: continue
+        ok, note, res2 = analyze(code, r["등락률"], r["종가"])
+        if not ok: print(f"제외 {r['name']}: {note}"); continue
+        c["note"], c["res2"] = note, res2
+        c["rr2"] = (res2 - r["종가"]) / (r["종가"] - c["sl"]) if res2 else None
+        c["news"] = news(code)
+        picked.append(c); time.sleep(0.2)
+
+    if picked:
+        head = f"🎯 <b>{NOW.strftime('%H:%M')} 눌림목 돌파 {len(picked)}건</b>  코스닥 {KQ:+.1f}%"
+        if WEAK: head += " ⚠️약세"
+        blocks = []
+        for c in picked:
+            r, d = c["r"], c["d"]; code = r["code"]; p = r["종가"]
+            t = f"<b>{link(code, r['name'])}</b> ({code})"
+            t += f"\n  {int(p):,}원  당일 {r['등락률']:+.1f}%"
+            t += (f"\n  📐 급등 +{c['rise']:.1f}% → 조정 {d['dd']:.1f}% ({d['corr_min']}분)"
+                  f" → 조정고점 {int(d['rb']):,} 돌파")
+            t += f"\n  💧 거래 재유입 ×{d['vol_ratio']:.1f} · VWAP위 ✅"
+            if c["note"]: t += f"\n  📈 {c['note']}"
+            t += f"\n  🛑 손절 {int(c['sl']):,} ({(c['sl']/p-1)*100:+.1f}%)"
+            t += f"\n  💰 1차 {int(d['hi']):,} ({(d['hi']/p-1)*100:+.1f}% · 1:{c['rr1']:.1f})"
+            if c["res2"]:
+                t += f"\n  💎 2차 {int(c['res2']):,} ({(c['res2']/p-1)*100:+.1f}% · 1:{c['rr2']:.1f})"
+            if code in active_ctx: t += f"\n  {active_ctx[code]}"
+            for n in c["news"]: t += f"\n  📰 {n}"
+            blocks.append(t)
+            sent[code] = {"t": STAMP, "kind": "눌림돌파"}
+        tg(head + "\n\n" + "\n\n".join(blocks))
+        print("알람", len(picked))
+        nt = pd.DataFrame([{"시각": STAMP, "유형": "눌림돌파", "code": c["r"]["code"], "name": c["r"]["name"],
+                            "알람가": c["r"]["종가"], "손절": round(c["sl"]), "목표1": round(c["d"]["hi"]),
+                            "목표2": round(c["res2"]) if c["res2"] else None, "손익비": round(c["rr1"], 1),
+                            "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
+                            "당일등락": c["r"]["등락률"], "30분": None, "60분": None,
+                            "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""} for c in picked])
+        if os.path.exists(TRACK):
+            try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
+            except Exception: pass
+        nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
+    else:
+        print("알람 없음")
     json.dump(sent, open(SENT, "w"))
 
-if today_cnt >= MAX_ALERTS: print("상한"); raise SystemExit(0)
-if streak_loss >= 2: print("2연패 중단"); raise SystemExit(0)
-if HHMM >= 1430: print("14:30 이후 신규 알람 중단"); raise SystemExit(0)
 
-if len(reg) < 5:
-    print(f"스냅샷 {len(reg)}개 - 패턴 판별에 5개 필요"); json.dump(sent, open(SENT, "w")); raise SystemExit(0)
+# ── 실행 ──
+set_clock()
+if not LOOP:
+    scan()
+    sys.exit(0)
 
-# ── 눌림목 돌파 탐지 ──
-def detect(seq):
-    """seq: [(t, price, cumval)] 오름차순. return dict or None"""
-    if len(seq) < 5: return None
-    n = len(seq)
-    cur_t, cur_p, cur_v = seq[-1]
-    prev_p = seq[-2][1]
-    # 1. 당일 고점 (현재 제외)
-    hi_i = max(range(n - 1), key=lambda i: seq[i][1])
-    hi_t, hi_p = seq[hi_i][0], seq[hi_i][1]
-    if hi_i >= n - 3: return None                       # 고점이 너무 최근이면 조정 없음
-    # 2. 조정 저점 (고점 이후, 현재 제외)
-    lo_i = min(range(hi_i + 1, n - 1), key=lambda i: seq[i][1])
-    lo_t, lo_p = seq[lo_i][0], seq[lo_i][1]
-    dd = (lo_p / hi_p - 1) * 100
-    if not (-9 <= dd <= -2.5): return None
-    if lo_t - hi_t < 15: return None                     # 조정 최소 15분
-    if lo_i >= n - 2: return None                        # 저점 후 최소 1스냅샷 필요
-    # 3. 조정 고점 (저점 이후, 현재 제외) = 반등 시도했다 막힌 자리
-    rb_i = max(range(lo_i + 1, n - 1), key=lambda i: seq[i][1])
-    rb_p = seq[rb_i][1]
-    if rb_p >= hi_p * 0.995: return None                 # 이미 고점 근처면 돌파 아님
-    if rb_p < lo_p * 1.005: return None                  # 반등 자체가 없음
-    # 4. 돌파: 이전엔 조정고점 아래, 지금은 위
-    if not (prev_p <= rb_p * 1.002 and cur_p > rb_p * 1.003): return None
-    if cur_p >= hi_p * 0.995: return None                # 이미 당일고점까지 다 올랐으면 늦음
-    # 5. 거래대금 재유입: 최근 구간 분당대금 vs 조정구간 평균
-    def pm(i, j):
-        dt = max(seq[j][0] - seq[i][0], 1); return (seq[j][2] - seq[i][2]) / dt
-    recent = pm(n - 2, n - 1)
-    corr = pm(hi_i, lo_i) if lo_i > hi_i else 1
-    rise = pm(0, hi_i) if hi_i > 0 else recent
-    if recent < corr * 1.3: return None                  # 조정 때보다 확실히 늘어야
-    if recent < rise * 0.5: return None                  # 상승 때의 절반은 돼야
-    return {"hi": hi_p, "lo": lo_p, "rb": rb_p, "dd": dd, "corr_min": lo_t - hi_t,
-            "since_lo": cur_t - lo_t, "recent_pm": recent, "vol_ratio": recent / max(corr, 1)}
-
-uni_map = uni.set_index("code")
-cands = []
-for _, r in cur.iterrows():
-    code = r["code"]
-    seq = series.get(code, [])
-    if len(seq) < 5 or seq[-1][1] != r["종가"]: continue
-    d = detect(seq)
-    if not d: continue
-    prev_close = r["종가"] / (1 + r["등락률"] / 100) if r["등락률"] > -99 else None
-    if not prev_close: continue
-    rise_pct = (d["hi"] / prev_close - 1) * 100
-    if rise_pct < 4: continue                            # 급등이라 할 만해야
-    if r["거래대금"] < 3e9: continue
-    v_ = vw.get(code)
-    if v_ is None or pd.isna(v_) or r["종가"] < v_: continue   # VWAP 위 필수
-    sl = d["lo"] * 0.995
-    risk = r["종가"] - sl
-    rew1 = d["hi"] - r["종가"]
-    rr1 = rew1 / risk if risk > 0 else 0
-    if rr1 < (1.5 if WEAK else 1.0): continue
-    cands.append({"r": r, "d": d, "rise": rise_pct, "sl": sl, "rr1": rr1, "vwap": v_})
-print(f"패턴 후보 {len(cands)}")
-
-cands.sort(key=lambda x: -x["rr1"])
-picked = []
-for c in cands:
-    if today_cnt + len(picked) >= MAX_ALERTS: break
-    r, d = c["r"], c["d"]; code = r["code"]
-    if code in sent: continue
-    ok, note, res2 = analyze(code, r["등락률"], r["종가"])
-    if not ok: print(f"제외 {r['name']}: {note}"); continue
-    c["note"], c["res2"] = note, res2
-    c["rr2"] = (res2 - r["종가"]) / (r["종가"] - c["sl"]) if res2 else None
-    c["news"] = news(code)
-    picked.append(c); time.sleep(0.2)
-
-if picked:
-    head = f"🎯 <b>{NOW.strftime('%H:%M')} 눌림목 돌파 {len(picked)}건</b>  코스닥 {KQ:+.1f}%"
-    if WEAK: head += " ⚠️약세"
-    blocks = []
-    for c in picked:
-        r, d = c["r"], c["d"]; code = r["code"]; p = r["종가"]
-        t = f"<b>{link(code, r['name'])}</b> ({code})"
-        t += f"\n  {int(p):,}원  당일 {r['등락률']:+.1f}%"
-        t += (f"\n  📐 급등 +{c['rise']:.1f}% → 조정 {d['dd']:.1f}% ({d['corr_min']}분)"
-              f" → 조정고점 {int(d['rb']):,} 돌파")
-        t += f"\n  💧 거래 재유입 ×{d['vol_ratio']:.1f} · VWAP위 ✅"
-        if c["note"]: t += f"\n  📈 {c['note']}"
-        t += f"\n  🛑 손절 {int(c['sl']):,} ({(c['sl']/p-1)*100:+.1f}%)"
-        t += f"\n  💰 1차 {int(d['hi']):,} ({(d['hi']/p-1)*100:+.1f}% · 1:{c['rr1']:.1f})"
-        if c["res2"]:
-            t += f"\n  💎 2차 {int(c['res2']):,} ({(c['res2']/p-1)*100:+.1f}% · 1:{c['rr2']:.1f})"
-        if code in active_ctx: t += f"\n  {active_ctx[code]}"
-        for n in c["news"]: t += f"\n  📰 {n}"
-        blocks.append(t)
-        sent[code] = {"t": STAMP, "kind": "눌림돌파"}
-    tg(head + "\n\n" + "\n\n".join(blocks))
-    print("알람", len(picked))
-    nt = pd.DataFrame([{"시각": STAMP, "유형": "눌림돌파", "code": c["r"]["code"], "name": c["r"]["name"],
-                        "알람가": c["r"]["종가"], "손절": round(c["sl"]), "목표1": round(c["d"]["hi"]),
-                        "목표2": round(c["res2"]) if c["res2"] else None, "손익비": round(c["rr1"], 1),
-                        "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
-                        "당일등락": c["r"]["등락률"], "30분": None, "60분": None,
-                        "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""} for c in picked])
-    if os.path.exists(TRACK):
-        try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
-        except Exception: pass
-    nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
-else:
-    print("알람 없음")
-json.dump(sent, open(SENT, "w"))
+# 반복 모드: 12:02 전에 시작하면 오전 세션(~12:02), 그 뒤면 오후 세션(~15:36)
+END = 12 * 60 + 2 if HHMM < 1202 else 15 * 60 + 36
+if NOW.weekday() >= 5 or HHMM >= 1536:
+    print("장 시간 외 - 종료"); sys.exit(0)
+print(f"반복 모드 시작 {NOW.strftime('%H:%M')} → {END//60:02d}:{END%60:02d}")
+prune_snaps()
+last_commit = time.time()
+while True:
+    t0 = time.time()
+    try:
+        scan()
+    except Exception as e:
+        print("scan 오류", e)
+    if time.time() - last_commit >= COMMIT_EVERY * 60:
+        git_commit(); last_commit = time.time()
+    set_clock()
+    if NOW.hour * 60 + NOW.minute >= END: break
+    time.sleep(max(5, INTERVAL - (time.time() - t0)))
+git_commit()
+print("세션 종료", NOW.strftime("%H:%M"))
+open("data/session_end.txt", "w").write("am" if END < 13 * 60 else "pm")
