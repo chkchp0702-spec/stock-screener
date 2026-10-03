@@ -36,7 +36,10 @@ jobs:
       - name: commit results
         if: always()
         run: |
-          git add -A data/
+          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/days data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
+            [ -e "$p" ] && git add -A "$p"
+          done
+          git add -u data/snaps
           git diff --staged --quiet || git commit -m "scan $(TZ=Asia/Seoul date +%H:%M)"
           git pull --rebase || true
           git push || true
