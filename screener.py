@@ -1,3 +1,4 @@
+import re
 import requests, pandas as pd, os, time, json, html, subprocess, sys, glob
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -55,7 +56,18 @@ def get(url, timeout=10):
     except Exception:
         return None
 
+def ntfy(msg):
+    """CH Investing 앱 알림 탭 → 휴대폰 푸시 (ntfy.sh, 무료·가입 없음)"""
+    try:
+        txt = re.sub(r"<[^>]+>", "", msg)
+        first = txt.strip().split("\n")[0][:80]
+        requests.post("https://ntfy.sh/", json={"topic": "chkchp-ch-danta", "title": "⚡ " + first, "message": txt[:900],
+                                               "tags": ["zap"], "click": "https://chkchp0702-spec.github.io/daily-app/#danta"}, timeout=10)
+    except Exception as e:
+        print("ntfy 실패", e)
+
 def tg(msg):
+    ntfy(msg)
     if not TG_TOKEN or not TG_CHAT: return
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
