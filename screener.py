@@ -56,12 +56,12 @@ def get(url, timeout=10):
     except Exception:
         return None
 
-def ntfy(msg):
+def ntfy(msg, topic="chkchp-ch-danta"):
     """CH Investing 앱 알림 탭 → 휴대폰 푸시 (ntfy.sh, 무료·가입 없음)"""
     try:
         txt = re.sub(r"<[^>]+>", "", msg)
         first = txt.strip().split("\n")[0][:80]
-        requests.post("https://ntfy.sh/", json={"topic": "chkchp-ch-danta", "title": "⚡ " + first, "message": txt[:900],
+        requests.post("https://ntfy.sh/", json={"topic": topic, "title": "⚡ " + first, "message": txt[:900],
                                                "tags": ["zap"], "click": "https://chkchp0702-spec.github.io/daily-app/#danta"}, timeout=10)
     except Exception as e:
         print("ntfy 실패", e)
@@ -74,6 +74,57 @@ def tg(msg):
                           data={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML",
                                 "disable_web_page_preview": "true"}, timeout=15)
         print("TG", r.status_code)
+    except Exception as e:
+        print("TG 실패", e)
+
+# ── 알람 품질 등급 · 시장 국면 (CH Investing 앱이 매일 계산한 값) ──
+APP_RAW = "https://raw.githubusercontent.com/chkchp0702-spec/daily-app/"
+_GI = None
+def grade_info():
+    """danta_stats.json 의 유형×시간대 품질(A/B/C) + 나침반 한국 국면 — 세션마다 한 번만 받기"""
+    global _GI
+    if _GI is None:
+        _GI = {"q": {}, "slot": {}, "all": None, "reg": None}
+        try:
+            j = requests.get(APP_RAW + "main/archive/x/danta_stats.json", timeout=10).json()
+            _GI["q"], _GI["slot"], _GI["all"] = j.get("quality") or {}, j.get("by_slot") or {}, (j.get("all") or {}).get("win")
+        except Exception as e:
+            print("품질 정보 실패", e)
+        try:
+            _GI["reg"] = requests.get(APP_RAW + "opdata/compass.json", timeout=15).json()["markets"]["KR"]["regime"]
+        except Exception as e:
+            print("국면 정보 실패", e)
+    return _GI
+
+def slot_now():
+    h = NOW.hour
+    return "09시" if h <= 9 else "10시" if h == 10 else "11~12시" if h <= 12 else "13시 이후"
+
+def tg_alarm(msg, kinds):
+    """새 알람: 텔레그램은 전부(기록용) · 앱 푸시는 등급/국면에 따라 나눠 보내기
+       chkchp-ch-danta      : 전부 (단, 한국이 하락장이면 A·B 등급만)
+       chkchp-ch-danta-a    : A 등급만
+       chkchp-ch-danta-best : 승률이 평균보다 높은 시간대에 뜬 알람만"""
+    g = grade_info()
+    sl = slot_now()
+    grades = [(g["q"].get(f"{k}|{sl}") or {}).get("grade") for k in kinds]
+    best = min([x for x in grades if x] or ["?"])
+    reg = g["reg"]
+    sw = (g["slot"].get(sl) or {}).get("win")
+    good_slot = sw is not None and g["all"] is not None and sw >= g["all"]
+    full = msg + f"\n\n🏷 품질 {best}" + (f" · {sl} 승률 {sw:.0f}%" if sw is not None else "") + (f" · 🧭 한국 {reg}" if reg else "")
+    if reg == "하락장" and best not in ("A", "B"):
+        full += "\n(하락장이라 C등급은 앱 푸시를 줄였어요)"
+    else:
+        ntfy(full)
+    if best == "A":
+        ntfy(full, "chkchp-ch-danta-a")
+    if good_slot:
+        ntfy(full, "chkchp-ch-danta-best")
+    if not TG_TOKEN or not TG_CHAT: return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      data={"chat_id": TG_CHAT, "text": full, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=15)
     except Exception as e:
         print("TG 실패", e)
 
@@ -507,7 +558,7 @@ def scan():
                              f"\n     🛑 {int(sl):,}  💰 {int(t1):,}  💎 {int(t2):,}")
                 rows_.append(trow("후발주", c, r["name"], p, r["등락률"], sl, t1, t2, 0.8))
         lines += ["", f"<i>청산: 1차 닿으면 절반 · 최고 대비 -{TRAIL_DROP:.0f}% · {TIME_STOP_MIN}분 무반응 · 안전손절 -4%</i>"]
-        tg("\n".join(lines)); print("섹터 알람", len(theme_alerts))
+        tg_alarm("\n".join(lines), ["후발주"]); print("섹터 알람", len(theme_alerts))
         add_track(rows_); json.dump(sent, open(SENT, "w"))
 
     if today_cnt >= MAX_ALERTS: print("상한"); json.dump(sent, open(SENT, "w")); return
@@ -546,7 +597,7 @@ def scan():
             lines.append(f"  🛑 {int(sl):,}  💰 {int(t1):,}  💎 {int(t2):,}")
             rows_.append(trow("거래폭발", code, r["name"], p, r["등락률"], sl, t1, t2, 0.8))
             sent[code] = {"t": STAMP, "kind": "거래폭발"}
-        tg("\n".join(lines)); print("폭발 알람", len(bursts))
+        tg_alarm("\n".join(lines), ["거래폭발"]); print("폭발 알람", len(bursts))
         add_track(rows_); today_cnt += len(bursts)
 
     # ── 🎯 눌림목 돌파 (대장주 우선) ──
@@ -637,7 +688,7 @@ def scan():
             sent[code] = {"t": STAMP, "kind": "눌림돌파"}
             rows_.append(trow("대장눌림" if c["lead"] else "눌림돌파", code, r["name"], p, r["등락률"],
                               c["sl"], d["hi"], c["res2"], round(c["rr1"], 1)))
-        tg(head + "\n\n" + "\n\n".join(blocks))
+        tg_alarm(head + "\n\n" + "\n\n".join(blocks), sorted({"대장눌림" if c["lead"] else "눌림돌파" for c in picked}))
         print("알람", len(picked)); add_track(rows_)
     else:
         print("알람 없음")
