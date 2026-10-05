@@ -37,9 +37,9 @@ jobs:
         if: always()
         run: |
           for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/days data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
-            [ -e "$p" ] && git add -A "$p"
+            if [ -e "$p" ]; then git add -A "$p"; fi
           done
-          git add -u data/snaps
+          git add -u data/snaps 2>/dev/null || true
           git diff --staged --quiet || git commit -m "scan $(TZ=Asia/Seoul date +%H:%M)"
           git pull --rebase || true
           git push || true
