@@ -66,6 +66,16 @@ def ntfy(msg, topic="chkchp-ch-danta"):
     except Exception as e:
         print("ntfy 실패", e)
 
+def feed(rows_):
+    """CH Investing 앱 단타 탭이 텔레그램과 같은 순간에 보도록 알람 줄을 그대로 보냄 (푸시 없음, 앱이 읽기만)"""
+    try:
+        keep = ["시각", "유형", "code", "name", "알람가", "손절", "목표1", "목표2", "당일등락", "손익비"]
+        out = [{k: (None if isinstance(r.get(k), float) and r.get(k) != r.get(k) else r.get(k)) for k in keep} for r in rows_]
+        requests.post("https://ntfy.sh/chkchp-ch-danta-feed", data=json.dumps(out, ensure_ascii=False, default=str).encode("utf-8"),
+                      headers={"Priority": "1"}, timeout=10)
+    except Exception as e:
+        print("feed 실패", e)
+
 def tg(msg):
     ntfy(msg)
     if not TG_TOKEN or not TG_CHAT: return
@@ -479,6 +489,7 @@ def scan():
             except Exception: pass
         nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
         NEW_ALARM[0] = True                       # 앱이 바로 보도록 이번 바퀴 끝에 즉시 저장
+        feed(rows_)
 
     def trow(kind, c, name, p, pct, sl, t1, t2, rr):
         return {"시각": STAMP, "유형": kind, "code": c, "name": name, "알람가": p,
