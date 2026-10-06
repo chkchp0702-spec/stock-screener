@@ -208,6 +208,8 @@ def sim_pct(x):
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
            "data/days", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
 
+NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
+
 def git_commit():
     try:
         for p in TRACKED:
@@ -476,6 +478,7 @@ def scan():
             try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
             except Exception: pass
         nt.to_csv(TRACK, index=False, encoding="utf-8-sig")
+        NEW_ALARM[0] = True                       # 앱이 바로 보도록 이번 바퀴 끝에 즉시 저장
 
     def trow(kind, c, name, p, pct, sl, t1, t2, rr):
         return {"시각": STAMP, "유형": kind, "code": c, "name": name, "알람가": p,
@@ -712,7 +715,8 @@ while True:
         scan()
     except Exception as e:
         print("scan 오류", e)
-    if time.time() - last_commit >= COMMIT_EVERY * 60:
+    if NEW_ALARM[0] or time.time() - last_commit >= COMMIT_EVERY * 60:
+        NEW_ALARM[0] = False
         git_commit(); last_commit = time.time()
     set_clock()
     if NOW.hour * 60 + NOW.minute >= END: break
