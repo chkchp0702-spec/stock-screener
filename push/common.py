@@ -9,7 +9,7 @@ KEYS = os.path.join(HERE, "keys.json")       # CH Investing 앱이 공개 열쇠
 SUBS = os.path.join(HERE, "subs.json")
 SUB_TOPIC = "chkchp-ch-pushsub-k4t9"
 TEST_TOPIC = "chkchp-ch-pushtest-k4t9"
-ALERT_TOPICS = ["chkchp-ch-" + t for t in ("focus", "danta", "cup", "gap", "accum", "compass", "whale", "report")]
+ALERT_TOPICS = ["chkchp-ch-" + t for t in ("focus", "danta", "cup", "gap", "accum", "compass", "whale", "report", "kick")]
 
 
 def box_key():
