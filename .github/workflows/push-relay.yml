@@ -1,0 +1,51 @@
+name: push-relay
+# 🔔 CH Investing 앱 푸시 중계 — 6시간씩 깨어 있으며 ntfy 알림 주제의 새 글을 앱을 켠 휴대폰으로 보낸다.
+#    끝나면 다음 교대를 직접 켠다(이어달리기). 예약은 빠졌을 때를 위한 예비.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: "몇 초 동안"
+        default: "21000"
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: push-relay
+  cancel-in-progress: false
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q pywebpush cryptography
+      - name: 이미 다른 중계가 돌고 있으면 끝
+        id: dup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/push-relay.yml/runs?status=in_progress&per_page=5" --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }})] | length")
+          echo "other=$n" >> $GITHUB_OUTPUT
+      - name: 중계
+        if: steps.dup.outputs.other == '0'
+        run: python3 push/relay.py ${{ github.event.inputs.secs || '21000' }}
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      - name: 구독 목록 저장
+        if: always() && steps.dup.outputs.other == '0'
+        run: |
+          python3 push/collect.py || true
+          git config user.name "github-actions"; git config user.email "actions@github.com"
+          git add push/subs.json
+          git diff --cached --quiet || (git commit -m "🔔 앱 푸시 구독 $(TZ=Asia/Seoul date '+%m/%d %H:%M')" && git pull --rebase -q && git push) || true
+      - name: 다음 교대 켜기
+        if: always() && steps.dup.outputs.other == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST repos/${{ github.repository }}/actions/workflows/push-relay.yml/dispatches -f ref=main || true

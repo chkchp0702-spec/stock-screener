@@ -1,0 +1,25 @@
+name: push-setup
+# 🔔 CH Investing 앱 푸시: 처음 한 번 열쇠 만들기 (push/keys.json — 비밀 열쇠는 TG_TOKEN 으로 잠금)
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "열쇠 새로 만들기 (모두 다시 켜야 함)"
+        default: "no"
+permissions:
+  contents: write
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -q cryptography && python3 push/setup.py $([ "${{ github.event.inputs.force }}" = "yes" ] && echo --force)
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      - run: |
+          git config user.name "github-actions"; git config user.email "actions@github.com"
+          git add push/keys.json
+          git diff --cached --quiet || (git commit -m "🔔 앱 푸시 열쇠" && git pull --rebase -q && git push)
