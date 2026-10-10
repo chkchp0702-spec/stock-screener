@@ -111,6 +111,50 @@ def grade_info():
             print("국면 정보 실패", e)
     return _GI
 
+# ── 🧪 스스로 배운 설정 (learn.py → data/learned.json · 세션 시작과 장중 매시간 다시 배움) ──
+_LR = {"mt": None, "j": None}
+def learned():
+    try:
+        mt = os.path.getmtime("data/learned.json")
+        if _LR["mt"] != mt:
+            _LR["j"] = json.load(open("data/learned.json")); _LR["mt"] = mt
+    except Exception:
+        _LR["j"] = None
+    return _LR["j"]
+
+def apply_learned():
+    """배운 손잡이를 이번 세션 설정에 반영 (표본이 모자라면 learn.py 가 기본값을 그대로 둠)"""
+    global LEAD_HOLD_MIN, FOL_MIN_PCT, FOL_MAX_PCT, BURST_X, TRAIL_ARM, TRAIL_DROP, HARD_SL, TIME_STOP_MIN, NEW_CUTOFF
+    j = learned()
+    if not j: return
+    p = j.get("params") or {}
+    try:
+        LEAD_HOLD_MIN = int(p.get("fol_hold", LEAD_HOLD_MIN))
+        FOL_MIN_PCT, FOL_MAX_PCT = map(float, p.get("fol_band", [FOL_MIN_PCT, FOL_MAX_PCT]))
+        BURST_X = float(p.get("burst_x", BURST_X))
+        er = p.get("exit_rule") or []
+        if er and er[0] == "trail":
+            TRAIL_ARM, TRAIL_DROP, HARD_SL, TIME_STOP_MIN = float(er[1]), float(er[2]), 1 + float(er[3]) / 100, int(er[4])
+        NEW_CUTOFF = int(p.get("cutoff", NEW_CUTOFF))
+    except Exception as e:
+        print("배운 설정 반영 실패", e)
+
+def lstate(kind, sl=None):
+    """유형×시간대 상태: 강함 · 켬 · 관찰 · 닫힘 (배운 게 없으면 켬)"""
+    j = learned()
+    if not j: return "켬", None
+    r = ((j.get("types") or {}).get(kind) or {}).get("slots", {}).get(sl or slot_now())
+    return (r or {}).get("st", "켬"), r
+
+def relearn():
+    try:
+        import learn
+        o = learn.learn(verbose=False)
+        apply_learned()
+        print("🧪 다시 배움", o.get("n_days"), "일 ·", o.get("changed") or "바뀜 없음", f"{o.get('secs')}초")
+    except Exception as e:
+        print("다시 배우기 실패", e)
+
 def slot_now():
     h = NOW.hour
     return "09시" if h <= 9 else "10시" if h == 10 else "11~12시" if h <= 12 else "13시 이후"
@@ -131,10 +175,22 @@ def tg_alarm(msg, kinds):
     grades = [q.get("grade") for q in qs]
     best = min([x for x in grades if x] or ["?"])
     observe = bool(qs) and all((q.get("n") or 0) >= OBS_N and q.get("grade") == "C" and (q.get("pnl") or 0) < OBS_PNL for q in qs)
-    if observe:
+    ls = [lstate(k, sl) for k in kinds]
+    l_obs = bool(ls) and all(st == "관찰" for st, _ in ls)
+    l_star = any(st == "강함" for st, _ in ls)
+    if l_obs and not observe:
+        r0 = ls[0][1] or {}
+        msg = (f"👀 <b>관찰 기록</b> — 🧪 쌓인 자료로 다시 돌려 보니 이 유형·시간대는 지는 쪽이에요 (n{r0.get('n')} · 평균 {r0.get('avg', 0):+.2f}%, 비용 뺌). "
+               "따라 사지 말고 지켜보기만. 성적이 좋아지면 저절로 다시 알림으로 보내요.\n\n" + msg)
+        observe = True
+    elif observe:
         q0 = max(qs, key=lambda q: q.get("pnl") or -99)
         msg = (f"👀 <b>관찰 기록</b> — 이 유형·시간대는 지금까지 성적이 나빠요 (n{q0.get('n')} · 승률 {q0.get('win', 0):.0f}% · 평균 {q0.get('pnl', 0):+.2f}%). "
                "따라 사지 말고 지켜보기만. 성적이 좋아지면 다시 알림으로 보내요.\n\n" + msg)
+    if l_star and not observe:
+        best = "A"
+        r0 = next(r for st, r in ls if st == "강함") or {}
+        msg = f"🧪 <b>이기는 자리</b> — 이 유형·시간대 n{r0.get('n')} · 평균 {r0.get('avg', 0):+.2f}% (비용 뺌)\n" + msg
     reg = g["reg"]
     sw = (g["slot"].get(sl) or {}).get("win")
     good_slot = sw is not None and g["all"] is not None and sw >= g["all"]
@@ -234,7 +290,7 @@ def sim_pct(x):
 
 # ── 저장소: 스냅샷은 로컬 1분 파일 + 하루 단위 압축본(data/days/)만 커밋 ──
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
-           "data/days", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
+           "data/days", "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
 
 NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
 
@@ -259,9 +315,14 @@ def save_day():
         fs = sorted(glob.glob(f"data/snaps/{TODAY}_*.csv"))
         if not fs: return
         parts = []
+        gz = f"data/days/{TODAY}.csv.gz"
+        if os.path.exists(gz):                     # 10/10: 오후 세션이 오전 압축본을 덮어써 09~12시 자료가 사라지던 문제 → 합쳐 저장
+            try: parts.append(pd.read_csv(gz, dtype={"code": str, "t": str}))
+            except Exception as e: print("기존 압축본 읽기 실패", e)
         for f in fs:
             s_ = pd.read_csv(f, dtype={"code": str}); s_.insert(0, "t", os.path.basename(f)[9:13]); parts.append(s_)
-        pd.concat(parts).to_csv(f"data/days/{TODAY}.csv.gz", index=False, compression="gzip")
+        m = pd.concat(parts); m["t"] = m["t"].astype(str).str.zfill(4)
+        m.drop_duplicates(subset=["t", "code"], keep="last").sort_values(["t", "code"]).to_csv(gz, index=False, compression="gzip")
         cut = (datetime.now(KST) - timedelta(days=DAY_KEEP)).strftime("%Y%m%d")
         for f in glob.glob("data/days/*.csv.gz"):
             if os.path.basename(f)[:8] < cut: os.remove(f)
@@ -463,6 +524,9 @@ def scan():
 
     if HHMM >= NEW_CUTOFF:
         print(f"{NEW_CUTOFF//100}:{NEW_CUTOFF%100:02d} 이후 신규 알람 없음"); return
+    OPEN = {k: lstate(k)[0] != "닫힘" for k in ("후발주", "대장눌림", "눌림돌파", "거래폭발")}
+    if not any(OPEN.values()):
+        print(f"{slot_now()}: 🧪 모든 유형 닫힘"); return
     if paused():
         print("오늘 /쉼"); return
 
@@ -518,7 +582,7 @@ def scan():
     # ── 섹터 발동 → 후발주 ──
     active_ctx, lead_codes, theme_alerts = {}, {}, []
     ydy = theme_yesterday()
-    if os.path.exists("data/themes.csv") and nreg >= 3 and HHMM >= 910:
+    if os.path.exists("data/themes.csv") and nreg >= 3 and HHMM >= 910 and OPEN["후발주"]:
         try:
             th = pd.read_csv("data/themes.csv", dtype={"code": str, "no": str})
             px = cur.set_index("code")
@@ -600,7 +664,7 @@ def scan():
 
     # ── ⚡ 거래 폭발 (1분 거래대금이 당일 평균의 BURST_X배 + 2분 내 +BURST_PX%) ──
     bursts = []
-    if burst_cnt < MAX_BURST:
+    if burst_cnt < MAX_BURST and OPEN["거래폭발"]:
         for _, r in cur.iterrows():
             code = r["code"]; seq = series.get(code, [])
             if len(seq) < 6 or code in sent or seq[-1][1] != r["종가"]: continue
@@ -683,6 +747,7 @@ def scan():
         risk = r["종가"] - sl
         rr1 = (d["hi"] - r["종가"]) / risk if risk > 0 else 0
         if rr1 < (1.5 if WEAK else 1.0): continue
+        if not OPEN["대장눌림" if code in lead_codes else "눌림돌파"]: continue
         cands.append({"r": r, "d": d, "rise": rise_pct, "sl": sl, "rr1": rr1, "lead": code in lead_codes})
     print(f"패턴 후보 {len(cands)} (대장 {sum(c['lead'] for c in cands)})")
 
@@ -729,6 +794,7 @@ def scan():
 
 # ── 실행 ──
 set_clock()
+apply_learned()
 if not LOOP:
     scan()
     sys.exit(0)
@@ -737,7 +803,8 @@ END = 12 * 60 + 2 if HHMM < 1202 else 15 * 60 + 36
 if NOW.weekday() >= 5 or HHMM >= 1536:
     print("장 시간 외 - 종료"); sys.exit(0)
 print(f"반복 모드 시작 {NOW.strftime('%H:%M')} → {END//60:02d}:{END%60:02d}")
-last_commit = time.time()
+relearn()                                   # 🧪 지금까지 쌓인 자료로 다시 배우고 시작
+last_commit = time.time(); last_learn = NOW.hour
 while True:
     t0 = time.time()
     try:
@@ -748,6 +815,8 @@ while True:
         NEW_ALARM[0] = False
         git_commit(); last_commit = time.time()
     set_clock()
+    if NOW.hour != last_learn and NOW.minute >= 5:   # 장중 매시간: 오늘 자료까지 넣어 다시 배움
+        last_learn = NOW.hour; relearn()
     if NOW.hour * 60 + NOW.minute >= END: break
     time.sleep(max(5, INTERVAL - (time.time() - t0)))
 save_day()

@@ -36,7 +36,7 @@ jobs:
       - name: commit results
         if: always()
         run: |
-          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/days data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
+          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/days data/learn data/learned.json data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
             if [ -e "$p" ]; then git add -A "$p"; fi
           done
           git add -u data/snaps 2>/dev/null || true
