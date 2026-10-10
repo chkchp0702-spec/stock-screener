@@ -7,7 +7,12 @@ KST = timezone(timedelta(hours=9))
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
 MAX_ALERTS = 5         # 하루 눌림돌파+거래폭발 상한
-MAX_THEME = 3          # 하루 섹터(후발주) 알람 상한
+MAX_THEME = 5          # 하루 섹터(후발주) 알람 상한 (10/10: 후발주가 유일하게 이기는 유형 — n25 승률 60% · 평균 +0.75%, 10시 n10 73% +1.67% → 3→5)
+# 🧪 쌓인 성적으로 이길 확률 높은 쪽으로 (10/10 사용자: "여태 쌓아온 데이터도 반영해서 이길 확률이 높은 방향으로 계속 나아가")
+#   유형×시간대 성적이 n≥OBS_N 이고 C 등급(평균 손익 < OBS_PNL)이면 「관찰」로만 기록 — 앱 푸시 안 함, 추적은 계속(데이터는 계속 쌓임)
+#   성적이 좋아지면(A/B) 자동으로 다시 푸시. 새 이름 유형은 성적이 쌓일 때까지 옛 유형 성적을 빌려 씀.
+OBS_N, OBS_PNL = 8, -0.3
+ALIAS = {"눌림돌파": "돌파", "대장눌림": "눌림목"}
 MAX_BURST = 2          # 하루 거래폭발 알람 상한
 
 # ── 실행 ──
@@ -117,19 +122,32 @@ def tg_alarm(msg, kinds):
        chkchp-ch-danta-best : 승률이 평균보다 높은 시간대에 뜬 알람만"""
     g = grade_info()
     sl = slot_now()
-    grades = [(g["q"].get(f"{k}|{sl}") or {}).get("grade") for k in kinds]
+    def q_of(k):
+        q = g["q"].get(f"{k}|{sl}") or {}
+        if (q.get("n") or 0) < OBS_N and k in ALIAS:
+            q = g["q"].get(f"{ALIAS[k]}|{sl}") or q
+        return q
+    qs = [q_of(k) for k in kinds]
+    grades = [q.get("grade") for q in qs]
     best = min([x for x in grades if x] or ["?"])
+    observe = bool(qs) and all((q.get("n") or 0) >= OBS_N and q.get("grade") == "C" and (q.get("pnl") or 0) < OBS_PNL for q in qs)
+    if observe:
+        q0 = max(qs, key=lambda q: q.get("pnl") or -99)
+        msg = (f"👀 <b>관찰 기록</b> — 이 유형·시간대는 지금까지 성적이 나빠요 (n{q0.get('n')} · 승률 {q0.get('win', 0):.0f}% · 평균 {q0.get('pnl', 0):+.2f}%). "
+               "따라 사지 말고 지켜보기만. 성적이 좋아지면 다시 알림으로 보내요.\n\n" + msg)
     reg = g["reg"]
     sw = (g["slot"].get(sl) or {}).get("win")
     good_slot = sw is not None and g["all"] is not None and sw >= g["all"]
     full = msg + f"\n\n🏷 품질 {best}" + (f" · {sl} 승률 {sw:.0f}%" if sw is not None else "") + (f" · 🧭 한국 {reg}" if reg else "")
-    if reg == "하락장" and best not in ("A", "B"):
+    if observe:
+        print("관찰 모드 — 앱 푸시 안 함", kinds, sl)
+    elif reg == "하락장" and best not in ("A", "B"):
         full += "\n(하락장이라 C등급은 앱 푸시를 줄였어요)"
     else:
-        ntfy(full)
-    if best == "A":
+        ntfy(("⭐ " if best == "A" else "") + full)
+    if best == "A" and not observe:
         ntfy(full, "chkchp-ch-danta-a")
-    if good_slot:
+    if good_slot and not observe:
         ntfy(full, "chkchp-ch-danta-best")
     if not TG_TOKEN or not TG_CHAT: return
     try:
