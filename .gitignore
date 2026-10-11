@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# 하루 1분 압축본은 days 브랜치에 (gitsync.py) — main 기록이 불지 않게
+data/days/

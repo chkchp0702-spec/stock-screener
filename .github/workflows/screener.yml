@@ -27,6 +27,9 @@ jobs:
       - run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+      - name: 하루 압축본 받기 (days 브랜치 → data/days, 학습·오후 세션용)
+        run: python gitsync.py days-pull
+        continue-on-error: true
       - run: python screener.py
         continue-on-error: true
         env:
@@ -36,13 +39,22 @@ jobs:
       - name: commit results
         if: always()
         run: |
-          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/days data/learn data/learned.json data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
+          # data/days 는 main 에 안 올림 (아래 days 브랜치로) — 작은 파일만
+          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/learn data/learned.json data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
             if [ -e "$p" ]; then git add -A "$p"; fi
           done
           git add -u data/snaps 2>/dev/null || true
           git diff --staged --quiet || git commit -m "scan $(TZ=Asia/Seoul date +%H:%M)"
-          git pull --rebase || true
-          git push || true
+          python gitsync.py push-main      # pull --rebase + 5번 재시도, 실패하면 단타 알림 + 빨간불
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+      - name: 하루 압축본 올리기 (days 브랜치, 커밋 하나 덮어쓰기)
+        if: always()
+        run: python gitsync.py days-push
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
       - name: afternoon session
         if: always()
         env:

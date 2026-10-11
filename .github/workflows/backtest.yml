@@ -22,6 +22,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests pandas numpy
+      - name: 하루 압축본 받기 (days 브랜치 → data/days)
+        run: python gitsync.py days-pull
       - run: python learn.py
       - run: python backtest.py
         env:
@@ -34,5 +36,7 @@ jobs:
           git config user.email "actions@github.com"
           git add -A data/backtest data/learn data/learned.json
           git diff --staged --quiet || git commit -m "backtest $(TZ=Asia/Seoul date +%m/%d)"
-          git pull --rebase || true
-          git push || true
+          python gitsync.py push-main      # pull --rebase + 5번 재시도, 실패하면 단타 알림 + 빨간불
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}

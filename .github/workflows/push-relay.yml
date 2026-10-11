@@ -43,7 +43,11 @@ jobs:
           python3 push/collect.py || true
           git config user.name "github-actions"; git config user.email "actions@github.com"
           git add push/subs.json
-          git diff --cached --quiet || (git commit -m "🔔 앱 푸시 구독 $(TZ=Asia/Seoul date '+%m/%d %H:%M')" && git pull --rebase -q && git push) || true
+          git diff --cached --quiet || git commit -m "🔔 앱 푸시 구독 $(TZ=Asia/Seoul date '+%m/%d %H:%M')"
+          python3 gitsync.py push-main     # 실패하면 단타 알림 + 빨간불 (다음 교대는 always 라 그대로 켜짐)
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
       - name: 다음 교대 켜기
         if: always() && steps.dup.outputs.other == '0'
         env:

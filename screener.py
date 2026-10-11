@@ -288,10 +288,12 @@ def sim_pct(x):
     except Exception:
         return x["현재"]
 
-# ── 저장소: 스냅샷은 로컬 1분 파일 + 하루 단위 압축본(data/days/)만 커밋 ──
+# ── 저장소: 1분 스냅샷은 로컬에만 · 하루 압축본(data/days/)은 main 이 아니라 `days` 브랜치(커밋 하나 덮어쓰기, gitsync.py)로 ──
+#    10/11: main 에 매 커밋마다 3~6MB 압축본이 다시 올라가 기록이 하루 10~15MB씩 불던 문제 → 장중 커밋은 작은 파일만
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
-           "data/days", "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
+           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
 
+PUSH_ALERTED = [False]                         # 올리기 실패 알림은 세션당 한 번만 (마지막은 워크플로가 빨간불로)
 NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
 
 def git_commit():
@@ -302,9 +304,11 @@ def git_commit():
         r = subprocess.run(["git", "diff", "--staged", "--quiet"])
         if r.returncode == 0: return
         subprocess.run(["git", "commit", "-q", "-m", f"scan {NOW.strftime('%H:%M')}"], check=False)
-        subprocess.run(["git", "pull", "--rebase", "-q"], check=False)
-        subprocess.run(["git", "push", "-q"], check=False)
-        print("커밋", NOW.strftime("%H:%M"))
+        import gitsync                                 # pull --rebase + 5번 다시 시도, 끝내 안 되면 세션당 한 번 알림
+        if gitsync.push_main(alert_fn=tg, quiet_alert=PUSH_ALERTED[0]):
+            print("커밋", NOW.strftime("%H:%M"))
+        else:
+            PUSH_ALERTED[0] = True
     except Exception as e:
         print("커밋 실패", e)
 

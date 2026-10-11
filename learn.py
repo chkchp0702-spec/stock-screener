@@ -6,8 +6,9 @@
   · 유형: 후발주(섹터 발동 뒤 따라가는 종목) · 대장눌림 · 눌림돌파(일반) · 거래폭발
   · 시간대: 09시 · 10시 · 11~12시 · 13시 이후 — 시간대별로 켬/관찰/끔을 정한다 (11:30 이후도 성적이 좋으면 연다)
   · 손잡이: 후발주 대장 유지시간·등락 밴드 · 거래폭발 배수 · 청산 규칙(트레일 폭·시간 손절) 중 성적이 가장 좋은 것
-  · 비용: 수수료·세금·체결 미끄러짐 0.3% 를 빼고 본다
-  · 과적합 막기: 표본 15건 미만은 바꾸지 않음 · 평균은 표본이 적을수록 0 쪽으로 눌러서(축소) 비교 · 지금 설정보다 확실히(+0.15%p) 나을 때만 바꿈
+  · 비용: 진입은 신호 다음 1분 가격 +0.2%(미끄러짐)로 사고, 왕복 비용 0.45%(매도세 ~0.2% + 수수료 + 미끄러짐)를 빼고 본다
+  · 과적합 막기(10/11): 쌓인 거래일 20일↑ 그리고 그 칸 표본 40건↑ 일 때만 켬/끔/강함을 바꿈 — 아니면 「관찰(obs)」: 숫자만 모으고
+    규칙은 기본값 그대로 · 평균은 표본이 적을수록 0 쪽으로 눌러서(축소, n+40) 비교 · 지금 설정보다 확실히(+0.15%p) 나을 때만 바꿈
   · 지나간 날 결과는 data/learn/YYYYMMDD.json 에 저장해 두고(다시 계산 안 함) 오늘 것만 새로 계산 → 장중에도 1분 안에 끝남
 """
 from __future__ import annotations
@@ -17,13 +18,17 @@ import numpy as np, pandas as pd
 
 KST = timezone(timedelta(hours=9))
 BROAD = ["지주", "밸류업", "배당", "기타", "신규상장", "코스피", "코스닥", "KRX", "MSCI", "지수", "우량"]
-COST = 0.3                    # 왕복 비용(%) — 수수료·세금·미끄러짐
+COST = 0.45                   # 왕복 비용(%) — 매도세(~0.18~0.2) + 수수료 + 미끄러짐 (10/11: 0.3 → 0.45)
+SLIP = 0.2                    # 진입 미끄러짐(%) — 신호 다음 1분 가격보다 이만큼 비싸게 산다고 봄
+MIN_DAYS = 20                 # 규칙(켬/끔/강함·손잡이)을 바꾸려면 쌓인 거래일이 이만큼 필요
+MIN_N = 40                    # …그리고 그 칸 표본이 이만큼 필요 (아래면 관찰만)
+SHRINK = 40                   # 축소 평균: 합 / (n + SHRINK)
 WIN = (910, 1450)             # 다시 돌려 보는 신규 진입 시간대 (실전은 learned.json 의 slots 로 정함)
 SLOTS = ["09시", "10시", "11~12시", "13시 이후"]
 CACHE = "data/learn"
 OUT = "data/learned.json"
-VER = 3                       # 계산 방식이 바뀌면 올림 → 캐시 다시 만듦
-PMIN = 25                     # 손잡이(밴드·배수·청산)를 바꾸려면 이만큼 표본이 필요
+VER = 4                       # 계산 방식이 바뀌면 올림 → 캐시 다시 만듦 (4: 다음 1분 진입·비용 0.45)
+PMIN = MIN_N                  # 손잡이(밴드·배수·청산)를 바꾸려면 이만큼 표본이 필요 (+ 거래일 MIN_DAYS)
 
 EXITS = {                                     # (팔 기준) 지금 쓰는 것 = 트레일 2/2·60분
     "트레일 2/2·60분": ("trail", 2, 2, -4, 60),
@@ -33,6 +38,7 @@ EXITS = {                                     # (팔 기준) 지금 쓰는 것 =
     "고정 −3/+5": ("fixed", -3, 5),
     "종가까지": ("close",),
 }
+DEF_ST = {"09시": "켬", "10시": "켬", "11~12시": "켬", "13시 이후": "닫힘"}   # 문턱을 못 넘은 칸이 쓰는 기본 규칙
 DEFAULT = {"fol_hold": 30, "fol_band": [2.5, 5.0], "burst_x": 5.0, "exit": "트레일 2/2·60분"}
 
 
@@ -265,11 +271,14 @@ def sig_burst(D, x):
 
 
 def outcomes(D, sig):
-    """신호 → [(시간대, {청산: 수익%})]"""
+    """신호 → [(시간대, {청산: 수익%})]
+       진입: 신호 뜬 분이 아니라 「다음 1분」 가격 + 미끄러짐 SLIP% (알람 보고 주문 넣는 현실). 다음 1분이 2분 넘게 비면 버림"""
     out = []
     for s in sig:
         i, k = s[0], s[1]
-        p0 = D["P"][i, k]; path = D["P"][i + 1:, k]
+        if i + 1 >= len(D["tm"]) or D["tm"][i + 1] - D["tm"][i] > 2:
+            continue
+        p0 = D["P"][i + 1, k] * (1 + SLIP / 100); path = D["P"][i + 2:, k]
         path = path[~np.isnan(path)]
         if np.isnan(p0) or len(path) < 3:          # 결과를 볼 시간이 아직 없음(오늘 막 뜬 신호)
             continue
@@ -305,7 +314,7 @@ def stat(rs):
         return {"n": 0}
     a = np.array(rs); g, l = a[a > 0].sum(), -a[a < 0].sum()
     return {"n": n, "avg": round(float(a.mean()), 2), "win": round(float((a > 0).mean() * 100)), "pf": round(float(g / l), 2) if l > 0 else 9.9,
-            "shr": round(float(a.sum() / (n + 10)), 3)}     # 표본이 적을수록 0 쪽으로 누른 평균 (비교용)
+            "shr": round(float(a.sum() / (n + SHRINK)), 3)}     # 표본이 적을수록 0 쪽으로 누른 평균 (비교용)
 
 
 def live_stats():
@@ -325,7 +334,7 @@ def live_stats():
         except Exception:
             pass
         return x["현재"]
-    t["sim"] = [sim(x) - COST for _, x in t.iterrows()]
+    t["sim"] = [sim(x) - COST - SLIP for _, x in t.iterrows()]     # 알람가에 바로 못 산다고 보고 미끄러짐도 뺌
     t["slot"] = [slot_of(int(str(s)[9:13])) for s in t["시각"]]
     for kind, g in t.groupby("유형"):
         k = {v: k for k, v in alias.items()}.get(kind, kind)
@@ -380,21 +389,23 @@ def learn(today_only_refresh=True, verbose=True):
 
     # 1) 청산 규칙: 모든 유형 합쳐 가장 좋은 것 (표본 많아 덜 흔들림)
     cur = DEFAULT["exit"]
+    nd = len(R)
+    day_ok = nd >= MIN_DAYS                       # 거래일이 모자라면 아무것도 안 바꿈 (관찰만)
     allobs = pool(lambda r: r["fol"].get("30|2.5-5.0", []) + r["대장눌림"] + r["눌림돌파"] + r["burst"].get("5.0", []))
     ex = by_exit(allobs)
     best_e = max(ex, key=lambda e: ex[e].get("shr", -9))
-    exit_pick = best_e if ex[best_e].get("n", 0) >= PMIN and ex[best_e]["shr"] >= ex[cur].get("shr", -9) + 0.15 else cur
+    exit_pick = best_e if day_ok and ex[best_e].get("n", 0) >= PMIN and ex[best_e]["shr"] >= ex[cur].get("shr", -9) + 0.15 else cur
 
     # 2) 후발주 손잡이
     fol = {k: stat([o["r"][exit_pick] for o in pool(lambda r, k=k: r["fol"].get(k, []))]) for k in [f"{h}|{b[0]}-{b[1]}" for h, b in FOL_GRID]}
     cur_f = f"{DEFAULT['fol_hold']}|{DEFAULT['fol_band'][0]}-{DEFAULT['fol_band'][1]}"
     best_f = max(fol, key=lambda k: fol[k].get("shr", -9))
-    fol_pick = best_f if fol[best_f].get("n", 0) >= PMIN and fol[best_f]["shr"] >= fol[cur_f].get("shr", -9) + 0.15 else cur_f
+    fol_pick = best_f if day_ok and fol[best_f].get("n", 0) >= PMIN and fol[best_f]["shr"] >= fol[cur_f].get("shr", -9) + 0.15 else cur_f
 
     # 3) 거래폭발 배수
     bur = {x: stat([o["r"][exit_pick] for o in pool(lambda r, x=x: r["burst"].get(x, []))]) for x in map(str, BURST_GRID)}
     best_b = max(bur, key=lambda x: bur[x].get("shr", -9))
-    burst_pick = best_b if bur[best_b].get("n", 0) >= PMIN and bur[best_b]["shr"] >= bur["5.0"].get("shr", -9) + 0.15 else "5.0"
+    burst_pick = best_b if day_ok and bur[best_b].get("n", 0) >= PMIN and bur[best_b]["shr"] >= bur["5.0"].get("shr", -9) + 0.15 else "5.0"
 
     # 4) 유형 × 시간대: 다시 돌린 결과 + 실제 알람 장부를 합쳐 켬/관찰/끔
     replay = {
@@ -415,22 +426,27 @@ def learn(today_only_refresh=True, verbose=True):
             n = a.get("n", 0) + b.get("n", 0)
             tot = a.get("avg", 0) * a.get("n", 0) + b.get("avg", 0) * b.get("n", 0)
             avg = tot / n if n else 0
-            shr = tot / (n + 10) if n else 0
-            if (n >= 15 and avg < -0.3) or (n >= 10 and avg < -1.0):
+            shr = tot / (n + SHRINK) if n else 0
+            if avg < -0.3:
                 st = "관찰"                       # 앱 푸시 안 함 · 텔레그램은 👀 기록 · 추적 계속
-            elif s == "13시 이후" and not (n >= 15 and shr > 0.1):
+            elif s == "13시 이후" and not shr > 0.1:
                 st = "닫힘"                       # 오후는 성적이 증명돼야 연다
-            elif n >= 15 and shr >= 0.25:
+            elif shr >= 0.25:
                 st = "강함"                       # ⭐ 앞으로 · 상한 +1
             else:
                 st = "켬"
+            base = DEF_ST[s]
+            ob = not (day_ok and n >= MIN_N)     # 문턱 못 넘음 → 규칙은 기본값 그대로, 배운 결과는 learn_st 로 보여 주기만
+            if ob:
+                st, learn_st = base, st
             if s == "13시 이후" and st in ("켬", "강함"):
                 open_late = True
-            rule[s] = {"st": st, "n": n, "avg": round(avg, 2), "replay": a, "live": b}
+            rule[s] = {"st": st, "n": n, "avg": round(avg, 2), "replay": a, "live": b, "obs": ob,
+                       **({"learn_st": learn_st} if ob else {})}
         ra, la = stat([o["r"][exit_pick] for o in obs]), lv.get("all", {"n": 0})
         n_all = ra.get("n", 0) + la.get("n", 0)
         avg_all = (ra.get("avg", 0) * ra.get("n", 0) + la.get("avg", 0) * la.get("n", 0)) / n_all if n_all else 0
-        if n_all >= 20 and avg_all < -0.5:            # 유형 전체가 확실히 지는 중 → 모든 시간대 관찰
+        if day_ok and n_all >= MIN_N and avg_all < -0.5:   # 유형 전체가 확실히 지는 중 → 모든 시간대 관찰
             for s in SLOTS:
                 if rule[s]["st"] != "닫힘":
                     rule[s]["st"] = "관찰"
@@ -440,7 +456,8 @@ def learn(today_only_refresh=True, verbose=True):
     b0, b1 = map(float, b.split("-"))
     out = {
         "at": datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "v": VER,
-        "days": [r["d"] for r in R], "n_days": len(R), "cost": COST,
+        "days": [r["d"] for r in R], "n_days": len(R), "cost": COST, "slip": SLIP, "entry": "next_min",
+        "gate": {"min_days": MIN_DAYS, "min_n": MIN_N, "days_ok": day_ok, "shrink": SHRINK},
         "params": {"fol_hold": int(h), "fol_band": [b0, b1], "burst_x": float(burst_pick), "exit": exit_pick,
                    "exit_rule": list(EXITS[exit_pick]), "cutoff": 1450 if open_late else 1130},
         "changed": [x for x, c in [("청산 " + exit_pick, exit_pick != cur), (f"후발주 유지 {h}분·밴드 {b0}~{b1}%", fol_pick != cur_f),
@@ -448,14 +465,16 @@ def learn(today_only_refresh=True, verbose=True):
         "types": types,
         "grid": {"exit": ex, "fol": fol, "burst": bur},
         "note": f"쌓인 1분 자료 {len(R)}일을 하루 전체로 다시 돌린 결과 + 실제 알람 {sum(v.get('all', {}).get('n', 0) for v in live.values())}건. "
-                f"비용 {COST}% 뺀 수익. 15건 미만은 바꾸지 않고, 지금 설정보다 확실히 나을 때만 바꿈.",
+                f"진입은 신호 다음 1분 +{SLIP}%, 비용 {COST}% 뺀 수익. 거래일 {MIN_DAYS}일·칸 표본 {MIN_N}건 미만은 관찰만(기본 규칙 유지), "
+                f"넘으면 지금 설정보다 확실히 나을 때만 바꿈.",
         "secs": round(time.time() - t0, 1),
     }
     json.dump(out, open(OUT, "w"), ensure_ascii=False, indent=1)
     if verbose:
         print(f"→ {OUT} · {out['secs']}초 · 바뀜: {out['changed'] or '없음'}")
         for k, v in types.items():
-            print(f"  {k}: " + " · ".join(f"{s} {r['st']}(n{r['n']} {r['avg']:+.2f})" for s, r in v["slots"].items()))
+            print(f"  {k}: " + " · ".join(f"{s} {r['st']}{'(관찰→' + r['learn_st'] + ')' if r['obs'] else ''}(n{r['n']} {r['avg']:+.2f})"
+                                          for s, r in v["slots"].items()))
     return out
 
 
