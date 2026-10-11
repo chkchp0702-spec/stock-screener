@@ -8,7 +8,7 @@
   · 손잡이: 후발주 대장 유지시간·등락 밴드 · 거래폭발 배수 · 청산 규칙(트레일 폭·시간 손절) 중 성적이 가장 좋은 것
   · 비용: 진입은 신호 다음 1분 가격 +0.2%(미끄러짐)로 사고, 왕복 비용 0.45%(매도세 ~0.2% + 수수료 + 미끄러짐)를 빼고 본다
   · 과적합 막기(10/11): 쌓인 거래일 20일↑ 그리고 그 칸 표본 40건↑ 일 때만 켬/끔/강함을 바꿈 — 아니면 「관찰(obs)」: 숫자만 모으고
-    규칙은 기본값 그대로 · 평균은 표본이 적을수록 0 쪽으로 눌러서(축소, n+40) 비교 · 지금 설정보다 확실히(+0.15%p) 나을 때만 바꿈
+    칸 상태는 10/11 직전 상태(frozen)로 얼려 둠 — 문턱 아래에선 켜기 금지, 실제 알람 n≥10·PF<0.7 이면 끄기(관찰)만 허용 · 평균은 표본이 적을수록 0 쪽으로 눌러서(축소, n+40) 비교 · 지금 설정보다 확실히(+0.15%p) 나을 때만 바꿈
   · 지나간 날 결과는 data/learn/YYYYMMDD.json 에 저장해 두고(다시 계산 안 함) 오늘 것만 새로 계산 → 장중에도 1분 안에 끝남
 """
 from __future__ import annotations
@@ -38,7 +38,9 @@ EXITS = {                                     # (팔 기준) 지금 쓰는 것 =
     "고정 −3/+5": ("fixed", -3, 5),
     "종가까지": ("close",),
 }
-DEF_ST = {"09시": "켬", "10시": "켬", "11~12시": "켬", "13시 이후": "닫힘"}   # 문턱을 못 넘은 칸이 쓰는 기본 규칙
+DEF_ST = {"09시": "켬", "10시": "켬", "11~12시": "켬", "13시 이후": "닫힘"}   # 얼린 상태가 아예 없을 때만 쓰는 마지막 기본값
+FROZEN_SEED = "data/learn/frozen.json"   # 10/11 문턱 도입 직전(커밋 29b2129) learned.json 의 칸 상태 — 문턱 못 넘은 칸은 이걸 그대로 씀
+LIVE_BAD_N, LIVE_BAD_PF = 10, 0.7        # 문턱 아래에서도 「끄기(관찰)」만은 허용: 실제 알람 n≥10 · 비용 뺀 PF<0.7
 DEFAULT = {"fol_hold": 30, "fol_band": [2.5, 5.0], "burst_x": 5.0, "exit": "트레일 2/2·60분"}
 
 
@@ -415,6 +417,15 @@ def learn(today_only_refresh=True, verbose=True):
         "거래폭발": pool(lambda r: r["burst"].get(burst_pick, [])),
     }
     live = live_stats()
+    frozen = None                         # 얼린 기준 상태: 지난 learned.json 의 frozen → 없으면 씨앗 파일
+    for f, key in ((OUT, "frozen"), (FROZEN_SEED, None)):
+        try:
+            j = json.load(open(f)); j = j.get(key) if key else j
+            if j and isinstance(j, dict) and j.get("types"):
+                frozen = j; break
+        except Exception:
+            pass
+    frozen = frozen or {"from": "기본값", "types": {}}
     types = {}
     open_late = False
     for kind, obs in replay.items():
@@ -435,10 +446,12 @@ def learn(today_only_refresh=True, verbose=True):
                 st = "강함"                       # ⭐ 앞으로 · 상한 +1
             else:
                 st = "켬"
-            base = DEF_ST[s]
-            ob = not (day_ok and n >= MIN_N)     # 문턱 못 넘음 → 규칙은 기본값 그대로, 배운 결과는 learn_st 로 보여 주기만
+            base = (frozen["types"].get(kind) or {}).get(s) or DEF_ST[s]
+            ob = not (day_ok and n >= MIN_N)     # 문턱 못 넘음 → 얼린 상태 그대로, 배운 결과는 learn_st 로 보여 주기만
             if ob:
-                st, learn_st = base, st
+                learn_st = st
+                live_bad = b.get("n", 0) >= LIVE_BAD_N and b.get("pf", 9.9) < LIVE_BAD_PF
+                st = "관찰" if (live_bad and base in ("켬", "강함")) else base   # 문턱 아래: 끄기만 가능, 켜기는 절대 안 함
             if s == "13시 이후" and st in ("켬", "강함"):
                 open_late = True
             rule[s] = {"st": st, "n": n, "avg": round(avg, 2), "replay": a, "live": b, "obs": ob,
@@ -463,6 +476,7 @@ def learn(today_only_refresh=True, verbose=True):
         "changed": [x for x, c in [("청산 " + exit_pick, exit_pick != cur), (f"후발주 유지 {h}분·밴드 {b0}~{b1}%", fol_pick != cur_f),
                                    (f"거래폭발 ×{burst_pick}", burst_pick != "5.0"), ("오후 신규 알람 열림", open_late)] if c],
         "types": types,
+        "frozen": frozen,
         "grid": {"exit": ex, "fol": fol, "burst": bur},
         "note": f"쌓인 1분 자료 {len(R)}일을 하루 전체로 다시 돌린 결과 + 실제 알람 {sum(v.get('all', {}).get('n', 0) for v in live.values())}건. "
                 f"진입은 신호 다음 1분 +{SLIP}%, 비용 {COST}% 뺀 수익. 거래일 {MIN_DAYS}일·칸 표본 {MIN_N}건 미만은 관찰만(기본 규칙 유지), "
