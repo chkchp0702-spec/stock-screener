@@ -74,7 +74,7 @@ def ntfy(msg, topic="chkchp-ch-danta"):
 def feed(rows_):
     """CH Investing 앱 단타 탭이 텔레그램과 같은 순간에 보도록 알람 줄을 그대로 보냄 (푸시 없음, 앱이 읽기만)"""
     try:
-        keep = ["시각", "유형", "code", "name", "알람가", "손절", "목표1", "목표2", "당일등락", "손익비"]
+        keep = ["시각", "유형", "code", "name", "알람가", "손절", "목표1", "목표2", "당일등락", "손익비", "알림"]
         out = [{k: (None if isinstance(r.get(k), float) and r.get(k) != r.get(k) else r.get(k)) for k in keep} for r in rows_]
         requests.post("https://ntfy.sh/chkchp-ch-danta-feed", data=json.dumps(out, ensure_ascii=False, default=str).encode("utf-8"),
                       headers={"Priority": "1"}, timeout=10)
@@ -159,9 +159,27 @@ def slot_now():
     h = NOW.hour
     return "09시" if h <= 9 else "10시" if h == 10 else "11~12시" if h <= 12 else "13시 이후"
 
+LAST_SENT = ["기록만"]                      # 직전 tg_alarm 결과 — add_track 이 tracking.csv 「알림」열에 적음
+
+def confident(kinds, sl, g, ls, qs):
+    """🙋 자신 있는 알람인가 (10/14 사용자: "자신 없으면 단타 알림 보내지 말고 기록만 해")
+       자신 있음 = 그 유형×시간대에 이긴 증거가 있을 때만
+         ① 🧪 배운 상태가 「강함」(다시 돌려 봐도 이기는 자리)  또는
+         ② 앱 품질표에서 n≥OBS_N 이고 A/B 등급이며 평균 손익 > 0
+       표본이 모자라거나(새 유형·새 시간대) C 등급·관찰이면 → 자신 없음 → 기록만"""
+    why = []
+    for k, (st, r), q in zip(kinds, ls, qs):
+        if st == "강함":
+            why.append(f"{k} 🧪강함 n{(r or {}).get('n')}"); continue
+        n, gr, pnl = q.get("n") or 0, q.get("grade"), q.get("pnl") or 0
+        if n >= OBS_N and gr in ("A", "B") and pnl > 0:
+            why.append(f"{k} {gr}등급 n{n} {pnl:+.2f}%"); continue
+        return False, f"{k}·{sl} 증거 부족 (n{n} · 등급 {gr or '?'} · {pnl:+.2f}% · 🧪{st})"
+    return True, " · ".join(why)
+
 def tg_alarm(msg, kinds):
-    """새 알람: 텔레그램은 전부(기록용) · 앱 푸시는 등급/국면에 따라 나눠 보내기
-       chkchp-ch-danta      : 전부 (단, 한국이 하락장이면 A·B 등급만)
+    """새 알람: 자신 있을 때만 알림(앱 푸시 + 텔레그램), 아니면 기록만 (tracking.csv · 앱 단타 탭 조용히)
+       chkchp-ch-danta      : 자신 있는 알람 (단, 한국이 하락장이면 A·B 등급만)
        chkchp-ch-danta-a    : A 등급만
        chkchp-ch-danta-best : 승률이 평균보다 높은 시간대에 뜬 알람만"""
     g = grade_info()
@@ -195,9 +213,17 @@ def tg_alarm(msg, kinds):
     sw = (g["slot"].get(sl) or {}).get("win")
     good_slot = sw is not None and g["all"] is not None and sw >= g["all"]
     full = msg + f"\n\n🏷 품질 {best}" + (f" · {sl} 승률 {sw:.0f}%" if sw is not None else "") + (f" · 🧭 한국 {reg}" if reg else "")
-    if observe:
-        print("관찰 모드 — 앱 푸시 안 함", kinds, sl)
-    elif reg == "하락장" and best not in ("A", "B"):
+    ok, why = confident(kinds, sl, g, ls, qs)
+    if observe or not ok:
+        # 🙋 자신 없음 → 알림(앱·텔레그램) 안 보내고 기록만. 추적·성적·학습은 그대로 쌓임
+        LAST_SENT[0] = "기록만"
+        print("기록만 — 자신 없음:", why if not ok else "관찰 모드", kinds, sl)
+        with open("data/quiet_log.txt", "a", encoding="utf-8") as f:
+            f.write(f"{STAMP}\t{','.join(kinds)}\t{sl}\t{why if not ok else '관찰'}\t{re.sub(r'<[^>]+>', '', msg.splitlines()[0])[:60]}\n")
+        return
+    LAST_SENT[0] = "보냄"
+    full += f"\n🙋 자신 있음: {why}"
+    if reg == "하락장" and best not in ("A", "B"):
         full += "\n(하락장이라 C등급은 앱 푸시를 줄였어요)"
     else:
         ntfy(("⭐ " if best == "A" else "") + full)
@@ -291,7 +317,7 @@ def sim_pct(x):
 # ── 저장소: 1분 스냅샷은 로컬에만 · 하루 압축본(data/days/)은 main 이 아니라 `days` 브랜치(커밋 하나 덮어쓰기, gitsync.py)로 ──
 #    10/11: main 에 매 커밋마다 3~6MB 압축본이 다시 올라가 기록이 하루 10~15MB씩 불던 문제 → 장중 커밋은 작은 파일만
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
-           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt"]
+           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt", "data/quiet_log.txt"]
 
 PUSH_ALERTED = [False]                         # 올리기 실패 알림은 세션당 한 번만 (마지막은 워크플로가 빨간불로)
 NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
@@ -440,7 +466,7 @@ def scan():
     # ── 추적 갱신 + 청산 ──
     TRACK = "data/tracking.csv"
     COLS = ["시각","유형","code","name","알람가","손절","목표1","목표2","손익비","VWAP위",
-            "코스닥","상승비율","당일등락","30분","60분","최고","최저","현재","청산알림"]
+            "코스닥","상승비율","당일등락","30분","60분","최고","최저","현재","청산알림","알림"]
     streak_loss, today_cnt, burst_cnt, exits = 0, 0, 0, []
     if os.path.exists(TRACK):
         try:
@@ -487,9 +513,12 @@ def scan():
             print("추적 실패", e)
     print(f"오늘 {today_cnt}건 · 연패 {streak_loss}")
 
-    if exits:
+    # 🙋 기록만 한 알람의 청산은 알리지 않음 (들은 적 없는 종목이니까) — tracking.csv 에는 그대로 적힘
+    loud = [e for e in exits if str(e[1].get("알림", "")) != "기록만"]
+    if len(loud) < len(exits): print("청산 기록만", len(exits) - len(loud))
+    if loud:
         lines = [f"🔔 <b>{NOW.strftime('%H:%M')} 청산</b>", ""]
-        for kind, row, p, chg in exits[:6]:
+        for kind, row, p, chg in loud[:6]:
             icon = {"1차목표": "💰", "2차목표": "💎", "손절": "🛑", "트레일링": "📉", "시간청산": "⏱"}[kind]
             tip = {"1차목표": " · 절반 익절, 나머지는 트레일링", "트레일링": f" · 최고 {row['최고']:+.1f}% 대비 -{TRAIL_DROP:.0f}%",
                    "시간청산": f" · {TIME_STOP_MIN}분 지나도 힘 없음"}.get(kind, "")
@@ -509,14 +538,15 @@ def scan():
                 if len(t):
                     sim = [sim_pct(x) for _, x in t.iterrows()]
                     win = sum(1 for s in sim if s > 0)
-                    lines += [f"알람 {len(t)}건 · 승 {win} 패 {len(t)-win}",
+                    q_n = int((t["알림"].astype(str) == "기록만").sum()) if "알림" in t.columns else 0
+                    lines += [f"알람 {len(t)}건 · 승 {win} 패 {len(t)-win}" + (f" · 🙋 자신 없어 기록만 {q_n}건" if q_n else ""),
                               f"💼 시뮬 평균 <b>{sum(sim)/len(sim):+.2f}%</b> · 종가 평균 {t['현재'].mean():+.2f}%"]
                     for kind, g in t.groupby("유형"):
                         s_ = [sim_pct(x) for _, x in g.iterrows()]
                         lines.append(f"   {kind} {len(g)}건 · 시뮬 {sum(s_)/len(s_):+.2f}%")
                     lines.append("")
                     for _, x in t.iterrows():
-                        lines.append(f"  {x['name']} 최고 {x['최고']:+.1f}% 최저 {x['최저']:+.1f}% → {x['현재']:+.1f}% {flag_of(x['청산알림'])}")
+                        lines.append(f"  {'📝 ' if str(x.get('알림', '')) == '기록만' else ''}{x['name']} 최고 {x['최고']:+.1f}% 최저 {x['최저']:+.1f}% → {x['현재']:+.1f}% {flag_of(x['청산알림'])}")
                 else:
                     lines.append("알람 없음" + (" (오늘 /쉼)" if paused() else " (조건 충족 종목 없음)"))
             missed = cur[(cur["등락률"] >= 8) & (~cur["code"].isin(alerted)) & (cur["거래대금"] >= 5e9)]
@@ -569,6 +599,7 @@ def scan():
         return (now_min - start) if start is not None else 0
 
     def add_track(rows_):
+        for r in rows_: r["알림"] = LAST_SENT[0]          # 보냄 / 기록만 (10/14)
         nt = pd.DataFrame(rows_)
         if os.path.exists(TRACK):
             try: nt = pd.concat([pd.read_csv(TRACK, dtype={"code": str}), nt], ignore_index=True)
@@ -581,7 +612,7 @@ def scan():
         return {"시각": STAMP, "유형": kind, "code": c, "name": name, "알람가": p,
                 "손절": round(sl), "목표1": round(t1), "목표2": round(t2) if t2 else None, "손익비": rr,
                 "VWAP위": True, "코스닥": round(KQ, 2), "상승비율": round(up_ratio),
-                "당일등락": pct, "30분": None, "60분": None, "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": ""}
+                "당일등락": pct, "30분": None, "60분": None, "최고": 0.0, "최저": 0.0, "현재": 0.0, "청산알림": "", "알림": "기록만"}
 
     # ── 섹터 발동 → 후발주 ──
     active_ctx, lead_codes, theme_alerts = {}, {}, []
