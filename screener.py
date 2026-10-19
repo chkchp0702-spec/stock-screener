@@ -159,6 +159,8 @@ def slot_now():
     h = NOW.hour
     return "09시" if h <= 9 else "10시" if h == 10 else "11~12시" if h <= 12 else "13시 이후"
 
+LIVE_KEEP_1019 = {"후발주|10시"}       # 10/19 기준 live 손익비 1.0↑·10건↑ 였던 칸
+LIVE_OPEN_N, LIVE_OPEN_PF = 20, 1.2      # 그 밖의 칸이 다시 알림이 되는 조건
 LAST_SENT = ["기록만"]                      # 직전 tg_alarm 결과 — add_track 이 tracking.csv 「알림」열에 적음
 
 def confident(kinds, sl, g, ls, qs):
@@ -168,6 +170,15 @@ def confident(kinds, sl, g, ls, qs):
          ② 앱 품질표에서 n≥OBS_N 이고 A/B 등급이며 평균 손익 > 0
        표본이 모자라거나(새 유형·새 시간대) C 등급·관찰이면 → 자신 없음 → 기록만"""
     why = []
+    # ⚖️ 10/19 사용자 「여태 맞은 쪽에 더 싣고 지는 쪽은 줄여 — 현시간부로」: 실제(live) 성적으로 이긴 칸만 알림.
+    #   9/16~10/15 tracking 99건: 60분 뒤 오른 비율 38% · 평균 −0.5% → 그날 live 손익비 1.0↑·10건↑ 인 칸(후발주 10시 — 10/19 15:05 학습 기준 21건 승률 76% pf 1.87)만 남김.
+    #   나머지 칸은 「기록만」(tracking 은 계속 쌓여 채점). 다시 켜는 조건: 그 칸 live 20건↑ · 손익비 1.2↑ 이면 저절로 알림.
+    for k, (st, r) in zip(kinds, ls):
+        lv = (r or {}).get("live") or {}
+        n, pf = lv.get("n") or 0, lv.get("pf")
+        keep = f"{k}|{sl}" in LIVE_KEEP_1019 and n >= 10 and (pf or 0) >= 1.0
+        if not (keep or (n >= LIVE_OPEN_N and (pf or 0) >= LIVE_OPEN_PF)):
+            return False, f"{k}·{sl} 실제 성적 부족 (live n{n} · 손익비 {pf if pf is not None else '?'} — 다시 켜기: {LIVE_OPEN_N}건↑·{LIVE_OPEN_PF}↑)"
     for k, (st, r), q in zip(kinds, ls, qs):
         if st == "강함":
             why.append(f"{k} 🧪강함 n{(r or {}).get('n')}"); continue
