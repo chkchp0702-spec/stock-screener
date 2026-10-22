@@ -20,6 +20,8 @@ KST = timezone(timedelta(hours=9))
 BROAD = ["지주", "밸류업", "배당", "기타", "신규상장", "코스피", "코스닥", "KRX", "MSCI", "지수", "우량"]
 COST = 0.45                   # 왕복 비용(%) — 매도세(~0.18~0.2) + 수수료 + 미끄러짐 (10/11: 0.3 → 0.45)
 SLIP = 0.2                    # 진입 미끄러짐(%) — 신호 다음 1분 가격보다 이만큼 비싸게 산다고 봄
+SLIP_DEF = SLIP
+SLIP_MIN_N, SLIP_LO, SLIP_HI = 20, SLIP, 1.0  # 📏 10/22: 실제 알람 20건↑ 실측 — 가정(0.2%)보다 나쁘면 실측으로 올리고(최대 1%), 좋아도 안 내림(1분 종가엔 호가 차이가 안 잡힘)
 MIN_DAYS = 20                 # 규칙(켬/끔/강함·손잡이)을 바꾸려면 쌓인 거래일이 이만큼 필요
 MIN_N = 40                    # …그리고 그 칸 표본이 이만큼 필요 (아래면 관찰만)
 SHRINK = 40                   # 축소 평균: 합 / (n + SHRINK)
@@ -319,6 +321,44 @@ def stat(rs):
             "shr": round(float(a.sum() / (n + SHRINK)), 3)}     # 표본이 적을수록 0 쪽으로 누른 평균 (비교용)
 
 
+def measure_slip():
+    """📏 실제 체결 비용 실측 (10/22 사용자 「다 진행」 — 퀀트 운용사 조사 ⑦, AQR 처럼 우리 기록으로 비용을 잰다)
+       알람이 뜬 분(알람가)과 그 다음 1분 가격의 차이 = 알람 보고 주문 넣을 때 실제로 더 주는 값.
+       20건 이상 모이면 실측 중앙값이 가정(0.2%)보다 클 때만 그 값으로 올림(최대 1%) — 1분 종가에는 호가 차이가 안 잡혀서 내리지는 않음. 알람 뒤로 값이 빠지면 음수(유리)도 그대로 셈."""
+    try:
+        t = pd.read_csv("data/tracking.csv", dtype={"code": str})
+    except Exception:
+        return {"n": 0, "use": SLIP_DEF, "basis": "가정"}
+    xs, cache = [], {}
+    for _, x in t.iterrows():
+        try:
+            d, hm = str(x["시각"])[:8], int(str(x["시각"])[9:13]); a0 = float(x["알람가"])
+        except Exception:
+            continue
+        if d not in cache:
+            try:
+                cache[d] = read_day(d)
+            except Exception:
+                cache[d] = None
+        D = cache[d]
+        if D is None or x["code"] not in D["codes"] or not a0 > 0:
+            continue
+        k = D["codes"].index(x["code"])
+        i = int(np.searchsorted(D["hhmm"], hm, side="right"))      # 알람 분 다음의 첫 1분
+        if i >= len(D["hhmm"]) or D["tm"][i] - (hm // 100 * 60 + hm % 100) > 3:
+            continue
+        p1 = D["P"][i, k]
+        if np.isfinite(p1) and p1 > 0:
+            xs.append((p1 / a0 - 1) * 100)
+    if not xs:
+        return {"n": 0, "use": SLIP_DEF, "basis": "가정"}
+    xs = np.array(xs)
+    med = float(np.median(xs))
+    use = round(min(SLIP_HI, max(SLIP_LO, med)), 2) if len(xs) >= SLIP_MIN_N else SLIP_DEF
+    return {"n": int(len(xs)), "median": round(med, 2), "mean": round(float(xs.mean()), 2), "p75": round(float(np.percentile(xs, 75)), 2),
+            "up_share": round(float((xs > 0).mean() * 100)), "use": use, "basis": (f"실측 {len(xs)}건 중앙값 {med:+.2f}%" + (" → 올림" if use > SLIP_DEF else " · 가정 유지")) if len(xs) >= SLIP_MIN_N else f"가정(실측 {len(xs)}/{SLIP_MIN_N}건)"}
+
+
 def live_stats():
     """실제 알람 장부(tracking.csv) — 근사 손익(안전손절 맞으면 손절, 1차 닿으면 1차, 아니면 종가) − 비용"""
     try:
@@ -346,6 +386,9 @@ def live_stats():
 
 def learn(today_only_refresh=True, verbose=True):
     t0 = time.time()
+    global SLIP
+    SM = measure_slip()
+    SLIP = SM.get("use", SLIP_DEF)
     os.makedirs(CACHE, exist_ok=True)
     TG = groups()
     today = datetime.now(KST).strftime("%Y%m%d")
@@ -469,7 +512,7 @@ def learn(today_only_refresh=True, verbose=True):
     b0, b1 = map(float, b.split("-"))
     out = {
         "at": datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "v": VER,
-        "days": [r["d"] for r in R], "n_days": len(R), "cost": COST, "slip": SLIP, "entry": "next_min",
+        "days": [r["d"] for r in R], "n_days": len(R), "cost": COST, "slip": SLIP, "slip_meas": SM, "entry": "next_min",
         "gate": {"min_days": MIN_DAYS, "min_n": MIN_N, "days_ok": day_ok, "shrink": SHRINK},
         "params": {"fol_hold": int(h), "fol_band": [b0, b1], "burst_x": float(burst_pick), "exit": exit_pick,
                    "exit_rule": list(EXITS[exit_pick]), "cutoff": 1450 if open_late else 1130},
@@ -478,8 +521,9 @@ def learn(today_only_refresh=True, verbose=True):
         "types": types,
         "frozen": frozen,
         "grid": {"exit": ex, "fol": fol, "burst": bur},
+        "trials": len(ex) + len(fol) + len(bur),   # 🧾 10/22 시도 장부 — 이번 학습이 견준 손잡이 조합 수(많을수록 1등은 운으로도 좋아 보임)
         "note": f"쌓인 1분 자료 {len(R)}일을 하루 전체로 다시 돌린 결과 + 실제 알람 {sum(v.get('all', {}).get('n', 0) for v in live.values())}건. "
-                f"진입은 신호 다음 1분 +{SLIP}%, 비용 {COST}% 뺀 수익. 거래일 {MIN_DAYS}일·칸 표본 {MIN_N}건 미만은 관찰만(기본 규칙 유지), "
+                f"진입은 신호 다음 1분 +{SLIP}%({SM.get('basis', '가정')}), 비용 {COST}% 뺀 수익. 거래일 {MIN_DAYS}일·칸 표본 {MIN_N}건 미만은 관찰만(기본 규칙 유지), "
                 f"넘으면 지금 설정보다 확실히 나을 때만 바꿈.",
         "secs": round(time.time() - t0, 1),
     }
