@@ -481,9 +481,11 @@ def main():
         if already_sent(today):
             log("오늘 이미 발송함 → 종료")
             return
-        if now > hhmm_to_dt(today, cfg["schedule"]["late_cutoff_kst"]):
-            log("발송 마감 시각 지남 → 종료")
-            return
+    # 10/27: GitHub 예약이 1~2시간씩 늦어 09:30 마감에 걸려 10/02 이후 브리핑이 하나도 안 남았음
+    #        → 늦어도 앱용 기록(briefing_data/daily)은 만들고, 텔레그램만 건너뜀
+    late = (not force) and now > hhmm_to_dt(today, cfg["schedule"]["late_cutoff_kst"])
+    if late:
+        log("발송 마감 시각 지남 → 기록만 만들고 텔레그램은 생략")
 
     # 1) 일봉 데이터 (먼저 받아두고 NXT 시각까지 대기)
     tickers = [m["ticker"] for m in cfg["macro"]] + list(cfg["global_sectors"])
@@ -518,8 +520,8 @@ def main():
                  "picks": [s["name"] for s in t["picks"]]} for t in a["ranked"][:cfg["scoring"]["top_sectors"]]],
     }, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    if env_on("DRY_RUN"):
-        log("DRY_RUN → 발송 생략")
+    if env_on("DRY_RUN") or late:
+        log("DRY_RUN·마감 지남 → 발송 생략")
         return
     if send_telegram(msg):
         mark_sent(today)
