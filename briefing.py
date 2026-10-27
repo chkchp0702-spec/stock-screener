@@ -232,7 +232,7 @@ def analyze(cfg: dict, prices: dict, nxt: dict, today) -> dict:
         df = prices.get(m["ticker"])
         if df is None:
             continue
-        macro.append({**m, "last": float(df["Close"].iloc[-1]), "r1": ret(df, 1), "r5": ret(df, 5)})
+        macro.append({**m, "last": float(df["Close"].iloc[-1]), "r1": ret(df, 1), "r5": ret(df, 5), "date": pd.to_datetime(df.index[-1]).date()})
 
     # 테마
     themes = {}
@@ -303,7 +303,8 @@ def analyze(cfg: dict, prices: dict, nxt: dict, today) -> dict:
     return {
         "glob": glob, "macro": macro, "themes": themes, "ranked": ranked,
         "kr_date": max(kr_dates) if kr_dates else None,
-        "us_date": max(us_dates) if us_dates else None,
+        "us_date": max([m["date"] for m in macro if m["ticker"] == "^GSPC"] or us_dates or [None]),   # 10/27: 간밤 글로벌은 지수(S&P) 날짜 — 섹터 ETF 는 야후가 하루 늦게 줄 때가 있음
+        "sec_date": max(us_dates) if us_dates else None,
         "nxt_count": sum(1 for t in themes.values() for s in t["stocks"] if s["nxt_session"] == "PRE_MARKET"),
     }
 
@@ -369,7 +370,7 @@ def build_message(cfg: dict, a: dict, now: datetime, weekly: bool) -> str:
     # 2) 미국 섹터 전일
     g = sorted([x for x in a["glob"] if x["r1"] is not None], key=lambda x: -x["r1"])
     if g:
-        L.append("<b>🇺🇸 미국 섹터 (전일)</b>")
+        L.append("<b>🇺🇸 미국 섹터 (전일)</b>" + (f" <i>({a['sec_date']:%m/%d} — 야후 섹터 자료가 하루 늦음)</i>" if a.get("sec_date") and a.get("us_date") and a["sec_date"] < a["us_date"] else ""))
         L.append("강세 " + ", ".join(f"{e(x['name'])} {fmt_pct(x['r1'])}" for x in g[:4]))
         L.append("약세 " + ", ".join(f"{e(x['name'])} {fmt_pct(x['r1'])}" for x in g[-3:][::-1]))
         L.append("")
