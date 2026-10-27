@@ -528,6 +528,8 @@ def main():
     (ARCHIVE_DIR / f"{today.isoformat()}.txt").write_text(msg, encoding="utf-8")
     (ARCHIVE_DIR / "latest.json").write_text(json.dumps({
         "date": today.isoformat(),
+        "us_date": str(a.get("us_date") or ""), "kr_date": str(a.get("kr_date") or ""),
+        "us_last": {t: str(pd.to_datetime(prices[t].index[-1]).date()) for t in list(cfg["global_sectors"])[:6] + [m["ticker"] for m in cfg["macro"]][:4] if t in prices},
         "top": [{"sector": t["name"], "score": round(t["score"], 3),
                  "picks": [s["name"] for s in t["picks"]]} for t in a["ranked"][:cfg["scoring"]["top_sectors"]]],
     }, ensure_ascii=False, indent=1), encoding="utf-8")
