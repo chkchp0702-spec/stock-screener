@@ -492,6 +492,18 @@ def main():
     for th in cfg["themes"].values():
         tickers += th.get("us", []) + list(th["stocks"])
     prices = download(tickers)
+    # 10/27: 야후가 미국 마지막 거래일(전날 밤)을 빼먹고 주는 일이 있음 → 미국 섹터 마지막 날짜가 기대보다 옛날이면 다시 받기(최대 3번)
+    exp = today - timedelta(days=1)
+    while exp.weekday() >= 5:
+        exp -= timedelta(days=1)
+    for k in range(3):
+        last_us = max([pd.to_datetime(prices[t].index[-1]).date() for t in cfg["global_sectors"] if t in prices] or [exp])
+        if last_us >= exp:
+            break
+        log(f"미국 자료가 {last_us} 까지만 옴(기대 {exp}) → 40초 뒤 다시 받기 {k + 1}/3")
+        time.sleep(40)
+        again = download(list(cfg["global_sectors"]) + [m["ticker"] for m in cfg["macro"]])
+        prices.update({t: df for t, df in again.items() if pd.to_datetime(df.index[-1]).date() >= pd.to_datetime(prices.get(t, df).index[-1]).date()})
     if len(prices) < len(set(tickers)) * 0.5:
         raise RuntimeError(f"시세 데이터 부족: {len(prices)}/{len(set(tickers))}")
 
