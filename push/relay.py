@@ -78,7 +78,8 @@ def main(secs):
     seen = set()
     last_ref = time.time()
     while time.time() < end:
-        msgs = poll(ALERT_TOPICS + [TEST_TOPIC], since)
+        utop = sorted({"chkchp-ch-u-" + s_.get("uid") for s_ in subs_raw.values() if s_.get("uid")})   # 10/28 내 알림 주제(사용자별)도 앱 푸시로
+        msgs = poll(ALERT_TOPICS + [TEST_TOPIC] + utop, since)
         for m in msgs:
             if m["id"] in seen:
                 continue
@@ -94,7 +95,13 @@ def main(secs):
                 continue
             p = {"title": m.get("title") or "CH Investing", "body": (m.get("message") or "")[:300],
                  "url": m.get("click") or APP, "tag": m["topic"].replace("chkchp-ch-", "")}
-            n = sum(send(i, p) for i in list(subs))
+            tag = p["tag"]
+            def want(i):   # 10/28 알림 다이어트: 👔 PB 기본 = brief + 자기 u-uid 만 · 전부 = 모든 공용 주제 + 자기 u-uid
+                r = subs_raw.get(i) or {}
+                if tag.startswith("u-"):
+                    return bool(r.get("uid")) and tag == "u-" + r["uid"]
+                return r.get("mode") != "pb" or tag == "brief"
+            n = sum(send(i, p) for i in list(subs) if want(i))
             log("보냄", p["tag"], p["title"][:30], f"{n}/{len(subs)}")
         if time.time() - last_ref > 300:
             refresh(); last_ref = time.time()

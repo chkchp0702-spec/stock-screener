@@ -1,6 +1,7 @@
 """🔔 앱 푸시 구독 모으기: ntfy(12시간 보관) → archive/x/push_subs.json (암호문 그대로 · 켬/끔 최신 것만)"""
 import datetime as dt
 import json
+import re
 import os
 import sys
 import urllib.request
@@ -33,7 +34,9 @@ def merge(subs, msgs):
         if b.get("op") == "on" and all(k in b for k in ("k", "iv", "ct")):
             old = subs.get(i)
             if not old or old.get("t", 0) <= m["time"]:
-                subs[i] = {"k": b["k"], "iv": b["iv"], "ct": b["ct"], "t": m["time"]}
+                subs[i] = {"k": b["k"], "iv": b["iv"], "ct": b["ct"], "t": m["time"],
+                           "mode": "pb" if b.get("mode") == "pb" else "all",                     # 10/28 알림 다이어트: pb = ☀️ PB 한 장 + 내 알림(u-uid)만
+                           "uid": str(b.get("uid") or "")[:16] if re.fullmatch(r"[a-z0-9]{6,16}", str(b.get("uid") or "")) else ""}
         elif b.get("op") == "off":
             if i in subs and subs[i].get("t", 0) <= m["time"]:
                 subs.pop(i)
