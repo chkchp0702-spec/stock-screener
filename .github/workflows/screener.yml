@@ -40,7 +40,7 @@ jobs:
         if: always()
         run: |
           # data/days 는 main 에 안 올림 (아래 days 브랜치로) — 작은 파일만
-          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/learn data/learned.json data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt; do
+          for p in data/tracking.csv data/sent.json data/summary_done.txt data/next_done.txt data/learn data/learned.json data/theme_log.csv data/paused.txt data/tg_offset.txt data/session_end.txt data/burst_warn.json; do
             if [ -e "$p" ]; then git add -A "$p"; fi
           done
           git add -u data/snaps 2>/dev/null || true

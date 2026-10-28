@@ -328,7 +328,7 @@ def sim_pct(x):
 # ── 저장소: 1분 스냅샷은 로컬에만 · 하루 압축본(data/days/)은 main 이 아니라 `days` 브랜치(커밋 하나 덮어쓰기, gitsync.py)로 ──
 #    10/11: main 에 매 커밋마다 3~6MB 압축본이 다시 올라가 기록이 하루 10~15MB씩 불던 문제 → 장중 커밋은 작은 파일만
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
-           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt", "data/quiet_log.txt"]
+           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt", "data/quiet_log.txt", "data/burst_warn.json"]
 
 PUSH_ALERTED = [False]                         # 올리기 실패 알림은 세션당 한 번만 (마지막은 워크플로가 빨간불로)
 NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
@@ -702,6 +702,41 @@ def scan():
         lines += ["", f"<i>청산: 1차 닿으면 절반 · 최고 대비 -{TRAIL_DROP:.0f}% · {TIME_STOP_MIN}분 무반응 · 안전손절 -4%</i>"]
         tg_alarm("\n".join(lines), ["후발주"]); print("섹터 알람", len(theme_alerts))
         add_track(rows_); json.dump(sent, open(SENT, "w"))
+
+    # ── ⚠️ 거래폭발 = 「따라 사지 마세요」 경고 (10/28 사용자 「넣어」) ──
+    #    1분 자료 15일 검증: 거래가 갑자기 터진 종목은 그날 종가까지 시장(500종목 가운데값)보다 평균 −2.7%p, 15일 중 13일 더 빠짐
+    #    → 사는 알람이 아니라 앱 경고 목록(data/burst_warn.json)으로만. 알람 상한·연패·켬/관찰 상태와 상관없이 매분 확인.
+    try:
+        if nreg >= 5 and HHMM >= 920:
+            WF = "data/burst_warn.json"; W = {}
+            if os.path.exists(WF):
+                try: W = json.load(open(WF))
+                except Exception: W = {}
+            if W.get("date") != TODAY: W = {"date": TODAY, "items": []}
+            have = {x["code"] for x in W["items"]}; new_w = []
+            for _, r in cur.iterrows():
+                code = r["code"]; seq = series.get(code, [])
+                if code in have or len(seq) < 6 or seq[-1][1] != r["종가"]: continue
+                if not (BURST_RANGE[0] <= r["등락률"] <= BURST_RANGE[1]) or r["거래대금"] < 2e9: continue
+                if seq[-1][0] - seq[-2][0] > 2: continue
+                rec, avg = pm_recent(seq, 1)
+                if avg <= 0 or rec / avg < BURST_X: continue
+                j = len(seq) - 2
+                while j > 0 and seq[-1][0] - seq[j][0] < 2: j -= 1
+                px2 = (seq[-1][1] / seq[j][1] - 1) * 100
+                if px2 < BURST_PX: continue
+                v_ = vw.get(code)
+                if v_ is None or pd.isna(v_) or r["종가"] < v_: continue
+                new_w.append({"t": NOW.strftime("%H:%M"), "code": code, "name": r["name"], "p": int(r["종가"]), "chg": round(float(r["등락률"]), 2),
+                              "x": round(rec / avg, 1), "px2": round(px2, 2)})
+            if new_w:
+                W["items"] = (W["items"] + sorted(new_w, key=lambda x: -x["x"]))[-40:]
+                W["at"] = NOW.strftime("%H:%M")
+                W["why"] = "1분 자료 15거래일 검증: 거래폭발 종목은 그날 종가까지 시장보다 평균 −2.7%p (15일 중 13일)"
+                json.dump(W, open(WF, "w"), ensure_ascii=False)
+                NEW_ALARM[0] = True; print("⚠️ 거래폭발 경고", len(new_w))
+    except Exception as e:
+        print("경고 목록 실패", e)
 
     if today_cnt >= MAX_ALERTS: print("상한"); json.dump(sent, open(SENT, "w")); return
     if streak_loss >= 2: print("2연패 중단"); json.dump(sent, open(SENT, "w")); return
