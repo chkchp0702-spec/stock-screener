@@ -328,7 +328,7 @@ def sim_pct(x):
 # ── 저장소: 1분 스냅샷은 로컬에만 · 하루 압축본(data/days/)은 main 이 아니라 `days` 브랜치(커밋 하나 덮어쓰기, gitsync.py)로 ──
 #    10/11: main 에 매 커밋마다 3~6MB 압축본이 다시 올라가 기록이 하루 10~15MB씩 불던 문제 → 장중 커밋은 작은 파일만
 TRACKED = ["data/tracking.csv", "data/sent.json", "data/summary_done.txt", "data/next_done.txt",
-           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt", "data/quiet_log.txt", "data/burst_warn.json"]
+           "data/learn", "data/learned.json", "data/theme_log.csv", "data/paused.txt", "data/tg_offset.txt", "data/session_end.txt", "data/quiet_log.txt", "data/burst_warn.json", "data/burst_log.csv"]
 
 PUSH_ALERTED = [False]                         # 올리기 실패 알림은 세션당 한 번만 (마지막은 워크플로가 빨간불로)
 NEW_ALARM = [False]                            # 새 알람이 생기면 10분 기다리지 않고 바로 커밋
@@ -734,6 +734,12 @@ def scan():
                 W["at"] = NOW.strftime("%H:%M")
                 W["why"] = "1분 자료 15거래일 검증: 거래폭발 종목은 그날 종가까지 시장보다 평균 −2.7%p (15일 중 13일)"
                 json.dump(W, open(WF, "w"), ensure_ascii=False)
+                # 10/29 사용자 「감춰~ 기록만 해둬」 — 앱에선 안 보이고, 날마다 지워지지 않게 쌓아 둠 (나중에 성적 확인용)
+                LF = "data/burst_log.csv"; newf = not os.path.exists(LF)
+                with open(LF, "a", encoding="utf-8") as fh:
+                    if newf: fh.write("date,t,code,name,p,chg,x,px2\n")
+                    for x in sorted(new_w, key=lambda x: -x["x"]):
+                        fh.write(f'{TODAY},{x["t"]},{x["code"]},{str(x["name"]).replace(",", " ")},{x["p"]},{x["chg"]},{x["x"]},{x["px2"]}\n')
                 NEW_ALARM[0] = True; print("⚠️ 거래폭발 경고", len(new_w))
     except Exception as e:
         print("경고 목록 실패", e)
