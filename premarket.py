@@ -20,6 +20,11 @@ def send(text):
         print(f"TG 전송 예외(도착했을 수 있음): {repr(e)[:80]}")
 
 
+# 🔧 11/14: 주말(KST 토·일)엔 프리마켓이 없어 NXT 가 빈 응답 → JSON 오류로 작업 실패(건강검진 「작업 실패: premarket」) — 조용히 끝냄
+if datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).weekday() >= 5:
+    print("주말 — 프리마켓 없음, 건너뜀")
+    raise SystemExit(0)
+
 # 1) NXT 프리마켓 시세
 r = requests.get("https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do",
                  headers=H, params={"pageUnit": 1000, "pageSize": 1000}, timeout=20)
