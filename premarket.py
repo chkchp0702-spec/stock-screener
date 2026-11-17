@@ -26,9 +26,28 @@ if datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).weekday
     raise SystemExit(0)
 
 # 1) NXT 프리마켓 시세
-r = requests.get("https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do",
-                 headers=H, params={"pageUnit": 1000, "pageSize": 1000}, timeout=20)
-lst = r.json().get("brdinfoTimeList", [])
+# 🔧 11/17: 평일 11/17 두 번(08:50·14:15) NXT 가 JSON 아닌 응답 → 작업 실패. GET·POST 를 번갈아 3번까지 다시 묻고, 그래도 안 되면 응답 모양을 남기고 실패(원인 찾기용)
+import time
+URL = "https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do"
+PRM = {"pageUnit": 1000, "pageSize": 1000}
+lst, last = None, ""
+for i in range(4):
+    try:
+        if i % 2 == 0:
+            r = requests.get(URL, headers=H, params=PRM, timeout=20)
+        else:
+            r = requests.post(URL, headers={**H, "X-Requested-With": "XMLHttpRequest"}, data=PRM, timeout=20)
+        lst = r.json().get("brdinfoTimeList", [])
+        break
+    except Exception as e:
+        try:
+            last = f"HTTP {r.status_code} {r.headers.get('content-type', '')} {len(r.text)}자 「{r.text[:120]!r}」"
+        except Exception:
+            last = repr(e)[:160]
+        print(f"NXT 응답 {i + 1}번째 실패: {last}")
+        time.sleep(6 * (i + 1))
+if lst is None:
+    raise SystemExit(f"NXT 프리마켓 자료를 4번 다 못 받음 — {last}")
 info = lst[0] if lst else {}
 cre = str(info.get("creTime", ""))
 
